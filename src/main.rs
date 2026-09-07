@@ -2,7 +2,7 @@ mod config;
 
 use anyhow::Error;
 use redis::AsyncCommands;
-use tokio_postgres::NoTls;
+use sqlx::postgres::PgPoolOptions;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -11,31 +11,25 @@ async fn main() -> Result<(), Error> {
     let config = config::env::Env::load()?;
     println!("config: {}", config);
 
-    let postgres = tokio_postgres::connect(config.db_url.as_str(), NoTls).await?;
-
-    tokio::spawn(async move {
-        if let Err(e) = postgres.1.await {
-            eprintln!("connection error: {}", e)
-        }
-    });
-
-    let rows = postgres
-        .0
-        .query("SELECT $1::TEXT", &[&"hello world"])
+    let postgres = PgPoolOptions::new()
+        .max_connections(10)
+        .connect(&config.db_url)
         .await?;
 
-    let value: &str = rows[0].get(0);
+    let value: String = sqlx::query_scalar("SELECT $1::TEXT")
+        .bind("hello world")
+        .fetch_one(&postgres)
+        .await?;
 
     println!("{}", value);
 
     let client = redis::Client::open(config.redis_url)?;
     let mut con = client.get_multiplexed_async_connection().await?;
 
-    // Async SET operation
     let _: () = con.set("my_key", "my_value").await?;
 
-    // Async GET operation
     let value: String = con.get("my_key").await?;
+
     println!("Retrieved: {}", value);
 
     Ok(())

@@ -1,7 +1,10 @@
 [package]
-name = "backend"
-version = "0.1.0"
+name = "truelabel-backend"
+version = "0.0.1"
 edition = "2024"
+description = "TrueLabel - Open-source barcode scanner with crowdsourced nutrition database"
+repository = "https://github.com/TarunVishwakarma1/true-lable"
+license = "Apache-2.0"
 
 [dependencies]
 anyhow = "1.0.104"

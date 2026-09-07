@@ -6,6 +6,7 @@ use std::str::FromStr;
 pub enum Environment {
     Development,
     Production,
+    Docker,
     Test,
 }
 
@@ -16,6 +17,7 @@ impl FromStr for Environment {
         Ok(match s.to_lowercase().as_str() {
             "prod" | "production" => Environment::Production,
             "test" | "testing" => Environment::Test,
+            "dock" | "docker" => Environment::Docker,
             _ => Environment::Development,
         })
     }
@@ -29,6 +31,10 @@ impl Environment {
     pub fn is_prod(&self) -> bool {
         matches!(self, Environment::Production)
     }
+
+    pub fn is_docker(&self) -> bool {
+        matches!(self, Environment::Docker)
+    }
 }
 
 impl Display for Environment {
@@ -36,6 +42,7 @@ impl Display for Environment {
         match self {
             Environment::Development => write!(f, "development"),
             Environment::Production => write!(f, "production"),
+            Environment::Docker => write!(f, "docker"),
             Environment::Test => write!(f, "test"),
         }
     }

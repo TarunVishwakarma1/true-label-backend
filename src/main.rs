@@ -1,6 +1,7 @@
 mod config;
 
 use anyhow::Error;
+use axum::routing::get;
 use redis::AsyncCommands;
 use sqlx::postgres::PgPoolOptions;
 
@@ -32,5 +33,16 @@ async fn main() -> Result<(), Error> {
 
     println!("Retrieved: {}", value);
 
+    router().await?;
+
+    Ok(())
+}
+
+async fn router() -> Result<(), Error> {
+    let router = axum::Router::new().route("/", get(|| async { "hello world" }));
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+
+    axum::serve(listener, router).await?;
     Ok(())
 }

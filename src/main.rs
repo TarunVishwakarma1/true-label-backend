@@ -1,6 +1,7 @@
 mod config;
 
 use anyhow::Error;
+use redis::AsyncCommands;
 use tokio_postgres::NoTls;
 
 #[tokio::main]
@@ -26,6 +27,16 @@ async fn main() -> Result<(), Error> {
     let value: &str = rows[0].get(0);
 
     println!("{}", value);
+
+    let client = redis::Client::open(config.redis_url)?;
+    let mut con = client.get_multiplexed_async_connection().await?;
+
+    // Async SET operation
+    let _: () = con.set("my_key", "my_value").await?;
+
+    // Async GET operation
+    let value: String = con.get("my_key").await?;
+    println!("Retrieved: {}", value);
 
     Ok(())
 }

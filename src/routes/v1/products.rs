@@ -1,9 +1,9 @@
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 use axum::{
+    Json, Router,
     extract::{Path, State},
     routing::get,
-    Json, Router,
 };
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};

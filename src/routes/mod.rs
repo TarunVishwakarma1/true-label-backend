@@ -2,7 +2,7 @@ pub mod health;
 pub mod v1;
 
 use crate::state::AppState;
-use axum::{routing::get, Router};
+use axum::{Router, routing::get};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 

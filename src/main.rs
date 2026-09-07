@@ -1,48 +1,66 @@
-mod config;
-
-use anyhow::Error;
-use axum::routing::get;
-use redis::AsyncCommands;
-use sqlx::postgres::PgPoolOptions;
+use anyhow::{Context, Result};
+use truelabel_backend::config::env::Env;
+use truelabel_backend::{build_app_state, create_app};
 
 #[tokio::main]
-async fn main() -> Result<(), Error> {
+async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
-    let config = config::env::Env::load()?;
-    println!("config: {}", config);
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "truelabel_backend=debug,tower_http=debug,info".into()),
+        )
+        .init();
 
-    let postgres = PgPoolOptions::new()
-        .max_connections(10)
-        .connect(&config.db_url)
-        .await?;
+    tracing::info!("Initializing TrueLabel backend service");
 
-    let value: String = sqlx::query_scalar("SELECT $1::TEXT")
-        .bind("hello world")
-        .fetch_one(&postgres)
-        .await?;
+    let config = Env::load().context("Failed to load environment configuration")?;
+    tracing::info!("{}", config);
 
-    println!("{}", value);
+    let state = build_app_state(config.clone()).await?;
+    let app = create_app(state);
 
-    let client = redis::Client::open(config.redis_url)?;
-    let mut con = client.get_multiplexed_async_connection().await?;
+    let addr = config.server_addr();
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("Failed to bind TCP listener to {addr}"))?;
 
-    let _: () = con.set("my_key", "my_value").await?;
+    tracing::info!("Server listening on http://{}", addr);
 
-    let value: String = con.get("my_key").await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .context("Server encountered an unexpected error")?;
 
-    println!("Retrieved: {}", value);
-
-    router().await?;
-
+    tracing::info!("Server shutdown completed");
     Ok(())
 }
 
-async fn router() -> Result<(), Error> {
-    let router = axum::Router::new().route("/", get(|| async { "hello world" }));
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C signal handler");
+    };
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM signal handler")
+            .recv()
+            .await;
+    };
 
-    axum::serve(listener, router).await?;
-    Ok(())
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            tracing::info!("Received Ctrl+C signal, initiating graceful shutdown...");
+        },
+        _ = terminate => {
+            tracing::info!("Received SIGTERM signal, initiating graceful shutdown...");
+        },
+    }
 }

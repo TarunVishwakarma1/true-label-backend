@@ -2,19 +2,16 @@ pub mod health;
 pub mod v1;
 
 use crate::state::AppState;
-use axum::{Router, routing::get};
+use axum::routing::{Router, get};
 use tower_http::cors::CorsLayer;
-use tower_http::trace::TraceLayer;
 
-pub fn build_router(state: AppState) -> Router {
+pub fn create_router(state: AppState) -> Router {
     Router::new()
-        .route(
-            "/",
-            get(|| async { "TrueLabel - Crowdsourced Nutrition & Barcode API" }),
-        )
-        .merge(health::router())
-        .nest("/api/v1", v1::router())
-        .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
+        .route("/", get(|| async { "TrueLabel API v0.1.0" }))
+        .route("/health", get(health::health))
+        .route("/health/live", get(health::liveness))
+        .route("/health/ready", get(health::readiness))
+        .nest("/api/v1", v1::v1_router())
         .with_state(state)
+        .layer(CorsLayer::permissive())
 }

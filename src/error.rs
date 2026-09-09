@@ -1,106 +1,89 @@
-use axum::{
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    Json,
-};
-use serde::Serialize;
+use axum::{Json, http::StatusCode, response::IntoResponse, response::Response};
+use serde_json::json;
 use thiserror::Error;
 
-pub type AppResult<T> = Result<T, AppError>;
-
-#[derive(Debug, Error)]
+#[derive(Error, Debug)]
 pub enum AppError {
+    #[error("Product not found")]
+    ProductNotFound,
+
+    #[error("Invalid barcode format")]
+    InvalidBarcode,
+
+    #[error("Invalid country code")]
+    InvalidCountry,
+
     #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
+    Database(String),
 
-    #[error("Redis cache error: {0}")]
-    Redis(#[from] redis::RedisError),
+    #[error("Cache error: {0}")]
+    Cache(String),
 
-    #[error("Resource not found: {0}")]
-    NotFound(String),
+    #[error("External API error: {0}")]
+    ExternalApi(String),
 
-    #[error("Bad request: {0}")]
-    BadRequest(String),
+    #[error("OCR processing failed: {0}")]
+    OcrFailed(String),
 
-    #[error("Unauthorized: {0}")]
-    Unauthorized(String),
+    #[error("Invalid request: {0}")]
+    InvalidRequest(String),
 
-    #[error("Internal server error: {0}")]
-    Internal(#[from] anyhow::Error),
-}
-
-#[derive(Serialize)]
-struct ErrorResponse {
-    success: bool,
-    error: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    details: Option<String>,
+    #[error("Internal server error")]
+    Internal,
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let (status, message, details) = match &self {
-            AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone(), None),
-            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone(), None),
-            AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone(), None),
-            AppError::Database(err) => {
-                tracing::error!(error = %err, "Database error encountered");
-                match err {
-                    sqlx::Error::RowNotFound => {
-                        (StatusCode::NOT_FOUND, "Record not found".to_string(), None)
-                    }
-                    _ => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "A database error occurred".to_string(),
-                        None,
-                    ),
-                }
-            }
-            AppError::Redis(err) => {
-                tracing::error!(error = %err, "Redis error encountered");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "A cache error occurred".to_string(),
-                    None,
-                )
-            }
-            AppError::Internal(err) => {
-                tracing::error!(error = %err, "Internal server error encountered");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "An unexpected error occurred".to_string(),
-                    None,
-                )
-            }
+        let (status, error_message) = match self {
+            AppError::ProductNotFound => (StatusCode::NOT_FOUND, "Product not found"),
+            AppError::InvalidBarcode => (
+                StatusCode::BAD_REQUEST,
+                "Invalid barcode format (8-14 digits)",
+            ),
+            AppError::InvalidCountry => (StatusCode::BAD_REQUEST, "Invalid country code"),
+            AppError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Database error"),
+            AppError::Cache(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Cache error"),
+            AppError::ExternalApi(_) => (StatusCode::BAD_GATEWAY, "External API error"),
+            AppError::OcrFailed(_) => (StatusCode::BAD_REQUEST, "OCR processing failed"),
+            AppError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, "Invalid request"),
+            AppError::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"),
         };
 
-        let body = Json(ErrorResponse {
-            success: false,
-            error: message,
-            details,
-        });
+        let body = Json(json!({
+            "status": "error",
+            "error": error_message,
+            "timestamp": chrono::Utc::now()
+        }));
 
         (status, body).into_response()
     }
 }
+
+pub type Result<T> = std::result::Result<T, AppError>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_error_status_codes() {
-        let err_not_found = AppError::NotFound("Item not found".into());
-        let res = err_not_found.into_response();
-        assert_eq!(res.status(), StatusCode::NOT_FOUND);
-
-        let err_bad_req = AppError::BadRequest("Invalid barcode".into());
-        let res = err_bad_req.into_response();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-
-        let err_unauth = AppError::Unauthorized("Invalid token".into());
-        let res = err_unauth.into_response();
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    fn maps_error_variants_to_expected_status_codes() {
+        assert_eq!(
+            AppError::ProductNotFound.into_response().status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            AppError::InvalidBarcode.into_response().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            AppError::ExternalApi("timeout".into())
+                .into_response()
+                .status(),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            AppError::Internal.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }
-

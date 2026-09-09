@@ -1,5 +1,5 @@
 pub mod postgres;
 pub mod redis;
 
-pub use postgres::init_postgres_pool;
-pub use self::redis::init_redis_client;
+pub use postgres::{check_postgres_health, create_pool, run_migrations};
+pub use redis::{check_redis_health, create_connection};

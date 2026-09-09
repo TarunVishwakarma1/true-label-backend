@@ -1,40 +1,29 @@
-use anyhow::{Context, Result};
-use truelabel_backend::config::env::Env;
-use truelabel_backend::{build_app_state, create_app};
-
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     dotenvy::dotenv().ok();
 
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "truelabel_backend=debug,tower_http=debug,info".into()),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    tracing::info!("Initializing TrueLabel backend service");
+    let config = truelabel_backend::config::Env::load().expect("Failed to load configuration");
 
-    let config = Env::load().context("Failed to load environment configuration")?;
-    tracing::info!("{}", config);
+    let addr = config.socket_addr();
 
-    let state = build_app_state(config.clone()).await?;
-    let app = create_app(state);
-
-    let addr = config.server_addr();
-    let listener = tokio::net::TcpListener::bind(&addr)
+    let app = truelabel_backend::build_app(config)
         .await
-        .with_context(|| format!("Failed to bind TCP listener to {addr}"))?;
+        .expect("Failed to build app");
 
-    tracing::info!("Server listening on http://{}", addr);
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("Failed to bind to socket");
+
+    tracing::info!("Server running on {}", addr);
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .context("Server encountered an unexpected error")?;
-
-    tracing::info!("Server shutdown completed");
-    Ok(())
+        .expect("Server error");
 }
 
 async fn shutdown_signal() {
@@ -56,11 +45,7 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => {
-            tracing::info!("Received Ctrl+C signal, initiating graceful shutdown...");
-        },
-        _ = terminate => {
-            tracing::info!("Received SIGTERM signal, initiating graceful shutdown...");
-        },
+        _ = ctrl_c => tracing::info!("Received Ctrl+C, shutting down"),
+        _ = terminate => tracing::info!("Received SIGTERM, shutting down"),
     }
 }

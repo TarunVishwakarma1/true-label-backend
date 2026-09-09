@@ -1,61 +1,62 @@
-use crate::db::postgres::check_postgres_health;
-use crate::db::redis::check_redis_health;
-use crate::state::AppState;
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    routing::get,
-    Json, Router,
-};
-use serde::Serialize;
+use crate::models::{HealthResponse, ReadinessResponse, ServiceStatus};
+use axum::{Json, extract::State, http::StatusCode};
 
-pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/health", get(health_check))
-        .route("/health/live", get(health_check))
-        .route("/health/ready", get(readiness_check))
-}
-
-#[derive(Serialize)]
-struct HealthResponse {
-    status: &'static str,
-    environment: String,
-    version: &'static str,
-}
-
-#[derive(Serialize)]
-struct ReadinessResponse {
-    status: &'static str,
-    database: &'static str,
-    redis: &'static str,
-}
-
-async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
-        status: "ok",
-        environment: state.config.environment.to_string(),
-        version: env!("CARGO_PKG_VERSION"),
+        status: "ok".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        environment: std::env::var("APP_ENV").unwrap_or_else(|_| "unknown".to_string()),
+        timestamp: chrono::Utc::now(),
     })
 }
 
-async fn readiness_check(State(state): State<AppState>) -> impl IntoResponse {
-    let db_ok = check_postgres_health(&state.db).await.is_ok();
-    let redis_ok = check_redis_health(&state.redis).await.is_ok();
+pub async fn liveness() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "alive".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        environment: std::env::var("APP_ENV").unwrap_or_else(|_| "unknown".to_string()),
+        timestamp: chrono::Utc::now(),
+    })
+}
 
-    let all_healthy = db_ok && redis_ok;
-    let status_code = if all_healthy {
+pub async fn readiness(
+    State(state): State<crate::state::AppState>,
+) -> (StatusCode, Json<ReadinessResponse>) {
+    let db_healthy = crate::db::check_postgres_health(&state.db).await.is_ok();
+    let redis_healthy = crate::db::check_redis_health(&state.redis).await.is_ok();
+
+    let status = if db_healthy && redis_healthy {
+        "ready"
+    } else {
+        "not_ready"
+    };
+    let code = if db_healthy && redis_healthy {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
 
     (
-        status_code,
+        code,
         Json(ReadinessResponse {
-            status: if all_healthy { "ready" } else { "degraded" },
-            database: if db_ok { "connected" } else { "unavailable" },
-            redis: if redis_ok { "connected" } else { "unavailable" },
+            status: status.to_string(),
+            database: ServiceStatus {
+                healthy: db_healthy,
+                message: if !db_healthy {
+                    Some("Database connection failed".to_string())
+                } else {
+                    None
+                },
+            },
+            redis: ServiceStatus {
+                healthy: redis_healthy,
+                message: if !redis_healthy {
+                    Some("Redis connection failed".to_string())
+                } else {
+                    None
+                },
+            },
+            timestamp: chrono::Utc::now(),
         }),
     )
 }

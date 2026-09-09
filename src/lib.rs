@@ -1,21 +1,29 @@
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod handlers;
+pub mod middleware;
+pub mod models;
 pub mod routes;
+pub mod services;
 pub mod state;
+pub mod utils;
 
-use anyhow::Result;
+use crate::{
+    config::Env,
+    db::{create_connection, create_pool, run_migrations},
+    routes::create_router,
+    state::AppState,
+};
 use axum::Router;
-use config::env::Env;
-use state::AppState;
 
-pub async fn build_app_state(config: Env) -> Result<AppState> {
-    let db = db::init_postgres_pool(&config).await?;
-    let redis = db::init_redis_client(&config).await?;
+pub async fn build_app(config: Env) -> Result<Router, Box<dyn std::error::Error>> {
+    let db = create_pool(&config.database_url, config.max_db_connections).await?;
+    run_migrations(&db).await?;
 
-    Ok(AppState::new(db, redis, config))
-}
+    let redis = create_connection(&config.redis_url).await?;
 
-pub fn create_app(state: AppState) -> Router {
-    routes::build_router(state)
+    let state = AppState::new(db, redis, config).await;
+
+    Ok(create_router(state))
 }

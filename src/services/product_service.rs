@@ -22,15 +22,18 @@ impl ProductService {
         }
     }
 
+    #[tracing::instrument(skip(self, query), fields(barcode = %query.barcode, country = %query.country))]
     pub async fn search_product(
         &self,
         query: &SearchProductQuery,
     ) -> Result<(ProductResponse, bool)> {
         if query.barcode.len() < 8 || query.barcode.len() > 14 {
+            tracing::warn!(barcode = %query.barcode, "rejected: invalid barcode length");
             return Err(AppError::InvalidBarcode);
         }
 
         if query.country.len() != 2 {
+            tracing::warn!(country = %query.country, "rejected: invalid country code");
             return Err(AppError::InvalidCountry);
         }
 
@@ -39,8 +42,10 @@ impl ProductService {
         if let Ok(Some(cached)) = self.cache.get(&cache_key).await
             && let Ok(product) = serde_json::from_str::<ProductResponse>(&cached)
         {
+            tracing::info!(cache_key = %cache_key, "cache hit");
             return Ok((product, true));
         }
+        tracing::debug!(cache_key = %cache_key, "cache miss");
 
         let product = sqlx::query_as::<_, Product>(
             "SELECT * FROM products WHERE barcode = $1 AND country = $2",
@@ -52,6 +57,7 @@ impl ProductService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         if let Some(p) = product {
+            tracing::info!(product_id = %p.id, source = %p.source, "database hit");
             let response = ProductResponse::from(p);
             let _ = self
                 .cache
@@ -59,6 +65,7 @@ impl ProductService {
                 .await;
             return Ok((response, false));
         }
+        tracing::info!("not in database, fetching from Open Food Facts");
 
         match self
             .off_client
@@ -155,16 +162,27 @@ impl ProductService {
                     is_palm_oil_free,
                 };
 
+                tracing::info!(
+                    product_id = %id,
+                    product_name = %response.product_name,
+                    additive_count = response.additives.as_ref().and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
+                    "created product from Open Food Facts"
+                );
+
                 let _ = self
                     .cache
                     .set(&cache_key, &serde_json::to_string(&response).unwrap(), 300)
                     .await;
                 Ok((response, false))
             }
-            None => Err(AppError::ProductNotFound),
+            None => {
+                tracing::info!("not found in Open Food Facts either");
+                Err(AppError::ProductNotFound)
+            }
         }
     }
 
+    #[tracing::instrument(skip(self, device_id), fields(barcode = %barcode, country = %country))]
     pub async fn verify_product(
         &self,
         barcode: &str,
@@ -201,12 +219,19 @@ impl ProductService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        let newly_verified = new_count >= 3 && !product.verified;
         if new_count >= 3 {
             sqlx::query("UPDATE products SET verified = TRUE WHERE id = $1")
                 .bind(product.id)
                 .execute(&self.db)
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+
+        if newly_verified {
+            tracing::info!(product_id = %product.id, verification_count = new_count, "product reached verified status");
+        } else {
+            tracing::info!(product_id = %product.id, verification_count = new_count, "verification recorded");
         }
 
         let cache_key = CacheService::cache_key(barcode, country);

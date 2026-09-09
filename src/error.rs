@@ -34,7 +34,7 @@ pub enum AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let (status, error_message) = match self {
+        let (status, error_message) = match &self {
             AppError::ProductNotFound => (StatusCode::NOT_FOUND, "Product not found"),
             AppError::InvalidBarcode => (
                 StatusCode::BAD_REQUEST,
@@ -48,6 +48,17 @@ impl IntoResponse for AppError {
             AppError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, "Invalid request"),
             AppError::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"),
         };
+
+        // Every error used to reach the client with zero server-side trace
+        // of what actually happened — a 500 in the logs told you nothing.
+        // 5xx (our fault) logs at error!, 4xx (caller's fault — bad input,
+        // not found) at warn!, so a log stream filtered to error! stays
+        // meaningful instead of drowning in routine "barcode not found"s.
+        if status.is_server_error() {
+            tracing::error!(error = %self, status = %status, "request failed");
+        } else {
+            tracing::warn!(error = %self, status = %status, "request rejected");
+        }
 
         let body = Json(json!({
             "status": "error",

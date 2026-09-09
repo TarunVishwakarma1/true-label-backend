@@ -52,10 +52,19 @@ impl OffClient {
         }
     }
 
+    #[tracing::instrument(skip(self), fields(barcode = %barcode, country = %country))]
     pub async fn get_product(&self, barcode: &str, country: &str) -> Result<Option<Value>> {
+        // A ready slot resolves immediately; only log when we actually had
+        // to queue behind the rate limit, so routine traffic doesn't spam
+        // the log with a line that's true (and uninteresting) every time.
+        if self.rate_limiter.check().is_err() {
+            tracing::warn!("rate limit reached, request queued");
+        }
+
         tokio::time::timeout(RATE_LIMIT_WAIT_TIMEOUT, self.rate_limiter.until_ready())
             .await
             .map_err(|_| {
+                tracing::error!("gave up waiting for a rate-limit slot after {:?}", RATE_LIMIT_WAIT_TIMEOUT);
                 AppError::ExternalApi(
                     "Open Food Facts is receiving high demand right now — try again shortly"
                         .to_string(),
@@ -63,26 +72,37 @@ impl OffClient {
             })?;
 
         let url = format!("{}/product/{}?country={}", self.base_url, barcode, country);
+        let started = std::time::Instant::now();
 
         let response = self
             .client
             .get(&url)
             .send()
             .await
-            .map_err(|e| AppError::ExternalApi(e.to_string()))?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "request to Open Food Facts failed");
+                AppError::ExternalApi(e.to_string())
+            })?;
 
-        if response.status() == 404 {
+        let status = response.status();
+        tracing::info!(status = %status, elapsed_ms = started.elapsed().as_millis(), "Open Food Facts responded");
+
+        if status == 404 {
             return Ok(None);
         }
 
-        if !response.status().is_success() {
-            return Err(AppError::ExternalApi(format!("HTTP {}", response.status())));
+        if !status.is_success() {
+            tracing::error!(status = %status, "Open Food Facts returned a non-success status");
+            return Err(AppError::ExternalApi(format!("HTTP {status}")));
         }
 
         let json: Value = response
             .json()
             .await
-            .map_err(|e| AppError::ExternalApi(e.to_string()))?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to decode Open Food Facts response body");
+                AppError::ExternalApi(e.to_string())
+            })?;
 
         Ok(Some(json))
     }

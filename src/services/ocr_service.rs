@@ -23,11 +23,14 @@ impl OcrService {
         Self { db }
     }
 
+    #[tracing::instrument(skip(self, req), fields(barcode = %req.barcode, country = %req.country))]
     pub async fn submit_label(&self, req: &SubmitLabelRequest) -> Result<OcrResponse> {
         if req.extracted_text.trim().is_empty() {
+            tracing::warn!("rejected: no text recognized in image");
             return Err(AppError::OcrFailed("No text recognized in image".to_string()));
         }
         if req.reviewed_ingredients.trim().is_empty() {
+            tracing::warn!("rejected: empty ingredients");
             return Err(AppError::InvalidRequest("Ingredients cannot be empty".to_string()));
         }
 
@@ -51,6 +54,14 @@ impl OcrService {
             "pending_verification"
         };
 
+        if status == "pending_verification" {
+            tracing::info!(confidence, status, "OCR submission received");
+        } else {
+            // Flagged submissions are the ones worth a human noticing —
+            // warn! keeps them visible in a log stream filtered above info.
+            tracing::warn!(confidence, status, dropped_allergen, "OCR submission flagged for review");
+        }
+
         let parsed_nutrition = json!({
             "guessed_name": guessed_name,
             "ingredients": req.reviewed_ingredients,
@@ -73,6 +84,46 @@ impl OcrService {
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // Without this, a contribution only ever lands in the review queue —
+        // scanning the same barcode again still finds nothing, which is
+        // exactly the "help us add it" flow's whole point defeated. This
+        // makes the barcode searchable immediately, same as an
+        // Open-Food-Facts-sourced product: `verified = false` until three
+        // independent verifications confirm it, through the same mechanism
+        // that already gates every other product. `ON CONFLICT DO NOTHING`
+        // rather than overwriting — if the barcode already exists (someone
+        // else's contribution landed first, or Open Food Facts has it after
+        // all), unverified OCR data shouldn't clobber it.
+        let allergens_text = if req.reviewed_allergens.is_empty() {
+            None
+        } else {
+            Some(req.reviewed_allergens.join(", "))
+        };
+        let product_name = if guessed_name.trim().is_empty() {
+            "Unknown"
+        } else {
+            &guessed_name
+        };
+        let insert_result = sqlx::query(
+            "INSERT INTO products (barcode, country, product_name, ingredients, allergens, nutrition_facts, source, verified, verification_count)
+             VALUES ($1, $2, $3, $4, $5, '{}'::jsonb, 'user_contributed', false, 0)
+             ON CONFLICT (barcode) DO NOTHING",
+        )
+        .bind(&req.barcode)
+        .bind(&req.country)
+        .bind(product_name)
+        .bind(&req.reviewed_ingredients)
+        .bind(&allergens_text)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        if insert_result.rows_affected() == 0 {
+            tracing::info!("barcode already existed, contribution kept in review queue only");
+        } else {
+            tracing::info!(product_name = %product_name, "created product from contribution");
+        }
 
         Ok(OcrResponse {
             guessed_name,

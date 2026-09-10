@@ -8,4 +8,5 @@ pub fn products_router() -> Router<AppState> {
     Router::new()
         .route("/search", get(crate::handlers::products::search_product))
         .route("/verify", post(crate::handlers::products::verify_product))
+        .route("/alternatives", get(crate::handlers::products::alternatives))
 }

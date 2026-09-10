@@ -1,6 +1,6 @@
 use crate::{
     error::Result,
-    models::{ApiResponse, ProductResponse, SearchProductQuery, VerifyProductRequest},
+    models::{AlternativesQuery, ApiResponse, ProductResponse, ProductSummary, SearchProductQuery, VerifyProductRequest},
     state::AppState,
 };
 use axum::{
@@ -26,4 +26,15 @@ pub async fn verify_product(
         .verify_product(&body.barcode, &body.country, &device_id)
         .await?;
     Ok(Json(ApiResponse::success(product, false)))
+}
+
+pub async fn alternatives(
+    State(state): State<AppState>,
+    Query(query): Query<AlternativesQuery>,
+) -> Result<Json<ApiResponse<Vec<ProductSummary>>>> {
+    let alternatives = state
+        .product_service
+        .find_alternatives(&query.barcode, &query.country, &query.sort_by)
+        .await?;
+    Ok(Json(ApiResponse::success(alternatives, false)))
 }

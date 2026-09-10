@@ -1,6 +1,6 @@
 use crate::{
     error::{AppError, Result},
-    models::{Product, ProductResponse, SearchProductQuery},
+    models::{Product, ProductResponse, ProductSummary, SearchProductQuery},
     services::cache_service::CacheService,
     services::openfoodfacts::OffClient,
 };
@@ -101,10 +101,11 @@ impl ProductService {
                 let is_vegan = dietary_flag(&analysis_tags, "en:vegan", "en:non-vegan");
                 let is_vegetarian = dietary_flag(&analysis_tags, "en:vegetarian", "en:non-vegetarian");
                 let is_palm_oil_free = dietary_flag(&analysis_tags, "en:palm-oil-free", "en:palm-oil");
+                let category = extract_category(product_obj);
 
                 let id = sqlx::query_scalar::<_, uuid::Uuid>(
-                    "INSERT INTO products (barcode, country, product_name, brand, image_url, nutrition_facts, ingredients, allergens, source, additives, nova_group, nutriscore_grade, is_vegan, is_vegetarian, is_palm_oil_free)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING id",
+                    "INSERT INTO products (barcode, country, product_name, brand, image_url, nutrition_facts, ingredients, allergens, source, additives, nova_group, nutriscore_grade, is_vegan, is_vegetarian, is_palm_oil_free, category)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING id",
                 )
                 .bind(&query.barcode)
                 .bind(&query.country)
@@ -121,6 +122,7 @@ impl ProductService {
                 .bind(is_vegan)
                 .bind(is_vegetarian)
                 .bind(is_palm_oil_free)
+                .bind(&category)
                 .fetch_one(&self.db)
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?;
@@ -160,6 +162,7 @@ impl ProductService {
                     is_vegan,
                     is_vegetarian,
                     is_palm_oil_free,
+                    category,
                 };
 
                 tracing::info!(
@@ -245,6 +248,68 @@ impl ProductService {
 
         Ok(ProductResponse::from(updated_product))
     }
+
+    /// Same-category products, cheapest-first on whichever nutrient the
+    /// caller's health profile is watching. Products without a `category`
+    /// (older rows, non-OFF sources) never appear here — an unmatched shelf
+    /// beats a wrong one. Empty is a legitimate answer, not an error: the
+    /// caller shows nothing rather than a fabricated suggestion.
+    #[tracing::instrument(skip(self), fields(barcode = %barcode, country = %country, sort_by = %sort_by))]
+    pub async fn find_alternatives(
+        &self,
+        barcode: &str,
+        country: &str,
+        sort_by: &str,
+    ) -> Result<Vec<ProductSummary>> {
+        let sort_key = match sort_by {
+            "sugar" | "sodium" => sort_by,
+            _ => {
+                tracing::warn!("unrecognized sort_by, defaulting to sugar");
+                "sugar"
+            }
+        };
+
+        let product = sqlx::query_as::<_, Product>(
+            "SELECT * FROM products WHERE barcode = $1 AND country = $2",
+        )
+        .bind(barcode)
+        .bind(country)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or(AppError::ProductNotFound)?;
+
+        let Some(category) = product.category else {
+            return Ok(Vec::new());
+        };
+
+        // sort_key is interpolated, not bound — but it's provably one of
+        // only two hardcoded literals ("sugar"/"sodium") from the match
+        // above, never the caller's raw input, so there's no injection
+        // surface despite the string-building.
+        let rows: Vec<(String, String, Option<f64>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT barcode, product_name, (nutrition_facts->>'{sort_key}')::float8 AS sort_value
+             FROM products
+             WHERE category = $1 AND country = $2 AND barcode != $3
+             ORDER BY sort_value ASC NULLS LAST
+             LIMIT 3"
+        )))
+        .bind(&category)
+        .bind(country)
+        .bind(barcode)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(barcode, product_name, sort_value)| ProductSummary {
+                barcode,
+                product_name,
+                sort_value,
+            })
+            .collect())
+    }
 }
 
 /// OFF tags E-numbers like `"en:e150d"` — strip the locale prefix and
@@ -260,6 +325,16 @@ fn extract_additives(product_obj: &serde_json::Value) -> Option<serde_json::Valu
         .map(|t| t.trim_start_matches("en:").to_uppercase())
         .collect();
     Some(json!(additives))
+}
+
+/// OFF's `categories_tags` runs general→specific (e.g. `["en:beverages",
+/// "en:fruit-drinks", "en:fruit-nectars"]`) — the last entry is the most
+/// specific shelf a product belongs to, which is what "same shelf"
+/// alternatives should actually match on.
+fn extract_category(product_obj: &serde_json::Value) -> Option<String> {
+    let tags = product_obj.get("categories_tags")?.as_array()?;
+    let last = tags.last()?.as_str()?;
+    Some(last.trim_start_matches("en:").to_string())
 }
 
 fn extract_analysis_tags(product_obj: &serde_json::Value) -> Vec<String> {
@@ -301,6 +376,18 @@ mod enrichment_tests {
         let product = json!({ "additives_tags": ["en:e150d", "en:e338"] });
         let additives = extract_additives(&product).unwrap();
         assert_eq!(additives, json!(["E150D", "E338"]));
+    }
+
+    #[test]
+    fn category_takes_the_most_specific_tag() {
+        let product = json!({ "categories_tags": ["en:beverages", "en:fruit-drinks", "en:fruit-nectars"] });
+        assert_eq!(extract_category(&product), Some("fruit-nectars".to_string()));
+    }
+
+    #[test]
+    fn category_is_none_when_field_absent() {
+        let product = json!({});
+        assert!(extract_category(&product).is_none());
     }
 
     #[test]

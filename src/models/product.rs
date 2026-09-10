@@ -30,6 +30,9 @@ pub struct Product {
     pub is_vegan: Option<bool>,
     pub is_vegetarian: Option<bool>,
     pub is_palm_oil_free: Option<bool>,
+    /// Open Food Facts' most specific `categories_tags` entry, e.g.
+    /// `"fruit-nectars"` — `None` for older rows and non-OFF sources.
+    pub category: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -54,6 +57,7 @@ pub struct ProductResponse {
     pub is_vegan: Option<bool>,
     pub is_vegetarian: Option<bool>,
     pub is_palm_oil_free: Option<bool>,
+    pub category: Option<String>,
 }
 
 impl From<Product> for ProductResponse {
@@ -77,8 +81,32 @@ impl From<Product> for ProductResponse {
             is_vegan: product.is_vegan,
             is_vegetarian: product.is_vegetarian,
             is_palm_oil_free: product.is_palm_oil_free,
+            category: product.category,
         }
     }
+}
+
+/// Just enough to render the "same shelf" line — not a full product payload.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProductSummary {
+    pub barcode: String,
+    pub product_name: String,
+    /// The value of whichever nutrient `sort_by` asked for, grams per 100g
+    /// (matches how `nutrition_facts` stores every nutrient already).
+    pub sort_value: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AlternativesQuery {
+    pub barcode: String,
+    #[serde(default = "default_country")]
+    pub country: String,
+    #[serde(default = "default_sort_by")]
+    pub sort_by: String,
+}
+
+fn default_sort_by() -> String {
+    "sugar".to_string()
 }
 
 #[derive(Debug, Deserialize)]

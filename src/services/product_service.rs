@@ -1,6 +1,6 @@
 use crate::{
     error::{AppError, Result},
-    models::{Product, ProductResponse, ProductSummary, SearchProductQuery},
+    models::{Product, ProductResponse, ProductSummary, SearchProductQuery, VerificationCandidate},
     services::cache_service::CacheService,
     services::openfoodfacts::OffClient,
 };
@@ -307,6 +307,53 @@ impl ProductService {
                 barcode,
                 product_name,
                 sort_value,
+            })
+            .collect())
+    }
+
+    /// Feeds the Verify tab's queue: products this device hasn't already
+    /// voted on, that haven't yet crossed the 3-verification threshold.
+    /// `device_id` absent (a fresh install, no identifierForVendor yet)
+    /// just skips the exclusion rather than erroring — an occasional
+    /// repeat card is a much smaller problem than a broken feed.
+    #[tracing::instrument(skip(self), fields(country = %country))]
+    pub async fn find_needs_verification(
+        &self,
+        country: &str,
+        device_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<VerificationCandidate>> {
+        let rows: Vec<(String, String, Option<String>, serde_json::Value, i32)> = sqlx::query_as(
+            "SELECT barcode, product_name, brand, nutrition_facts, verification_count
+             FROM products
+             WHERE country = $1 AND verification_count < 3
+               AND ($2::text IS NULL OR NOT EXISTS (
+                 SELECT 1 FROM verifications v
+                 JOIN products p2 ON p2.id = v.product_id
+                 WHERE p2.barcode = products.barcode AND v.device_id = $2
+               ))
+             ORDER BY created_at DESC
+             LIMIT $3",
+        )
+        .bind(country)
+        .bind(device_id)
+        .bind(limit)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(barcode, product_name, brand, nutrition_facts, verification_count)| {
+                VerificationCandidate {
+                    barcode,
+                    product_name,
+                    brand,
+                    energy_kcal: nutrition_facts.get("energy_kcal").and_then(|v| v.as_f64()),
+                    sugar: nutrition_facts.get("sugar").and_then(|v| v.as_f64()),
+                    sodium: nutrition_facts.get("sodium").and_then(|v| v.as_f64()),
+                    verification_count,
+                }
             })
             .collect())
     }

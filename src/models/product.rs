@@ -109,6 +109,33 @@ fn default_sort_by() -> String {
     "sugar".to_string()
 }
 
+/// One card in the Verify tab's queue — enough to ask "does this look
+/// right?" without claiming a full product payload the caller hasn't
+/// fetched.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VerificationCandidate {
+    pub barcode: String,
+    pub product_name: String,
+    pub brand: Option<String>,
+    pub energy_kcal: Option<f64>,
+    pub sugar: Option<f64>,
+    pub sodium: Option<f64>,
+    pub verification_count: i32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NeedsVerificationQuery {
+    #[serde(default = "default_country")]
+    pub country: String,
+    pub device_id: Option<String>,
+    #[serde(default = "default_verification_limit")]
+    pub limit: i64,
+}
+
+fn default_verification_limit() -> i64 {
+    10
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SearchProductQuery {
     pub barcode: String,

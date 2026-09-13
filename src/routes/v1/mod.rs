@@ -1,7 +1,6 @@
 pub mod ocr;
 pub mod products;
-pub mod users;
-pub mod verifications;
+pub mod me;
 
 use crate::state::AppState;
 use axum::routing::Router;
@@ -9,7 +8,7 @@ use axum::routing::Router;
 pub fn v1_router() -> Router<AppState> {
     Router::new()
         .nest("/products", products::products_router())
-        .nest("/users", users::users_router())
-        .nest("/verifications", verifications::verifications_router())
+        .nest("/auth", me::auth_router())
+        .nest("/me", me::me_router())
         .nest("/ocr", ocr::ocr_router())
 }

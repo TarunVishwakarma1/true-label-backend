@@ -28,6 +28,12 @@ pub enum AppError {
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
 
+    #[error("Unauthorized")]
+    Unauthorized,
+
+    #[error("Too many requests")]
+    TooManyRequests,
+
     #[error("Internal server error: {0}")]
     Internal(String),
 }
@@ -46,6 +52,14 @@ impl IntoResponse for AppError {
             AppError::ExternalApi(_) => (StatusCode::BAD_GATEWAY, "External API error"),
             AppError::OcrFailed(_) => (StatusCode::BAD_REQUEST, "OCR processing failed"),
             AppError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, "Invalid request"),
+            AppError::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                "Missing or invalid device token",
+            ),
+            AppError::TooManyRequests => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many requests — slow down and try again shortly",
+            ),
             AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"),
         };
 
@@ -78,6 +92,14 @@ mod tests {
 
     #[test]
     fn maps_error_variants_to_expected_status_codes() {
+        assert_eq!(
+            AppError::Unauthorized.into_response().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            AppError::TooManyRequests.into_response().status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
         assert_eq!(
             AppError::ProductNotFound.into_response().status(),
             StatusCode::NOT_FOUND

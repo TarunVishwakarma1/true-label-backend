@@ -26,7 +26,18 @@ impl OcrService {
     }
 
     #[tracing::instrument(skip(self, req), fields(barcode = %req.barcode, country = %req.country))]
-    pub async fn submit_label(&self, req: &SubmitLabelRequest) -> Result<OcrResponse> {
+    pub async fn submit_label(&self, req: &SubmitLabelRequest, device_id: &str) -> Result<OcrResponse> {
+        // Trust boundary: these arrive from a client and end up in a shared
+        // table, so their size is bounded before anything is written.
+        if req.extracted_text.chars().count() > MAX_EXTRACTED_TEXT
+            || req.reviewed_ingredients.chars().count() > MAX_INGREDIENTS
+            || req.reviewed_allergens.len() > MAX_ALLERGENS
+        {
+            tracing::warn!("rejected: submission over the size limits");
+            return Err(AppError::InvalidRequest(
+                "submission is too large".to_string(),
+            ));
+        }
         if req.extracted_text.trim().is_empty() {
             tracing::warn!("rejected: no text recognized in image");
             return Err(AppError::OcrFailed("No text recognized in image".to_string()));
@@ -89,8 +100,8 @@ impl OcrService {
         });
 
         sqlx::query(
-            "INSERT INTO ocr_submissions (barcode, country, extracted_text, parsed_nutrition, confidence_score, status)
-             VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO ocr_submissions (barcode, country, extracted_text, parsed_nutrition, confidence_score, status, device_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(&req.barcode)
         .bind(&req.country)
@@ -98,6 +109,7 @@ impl OcrService {
         .bind(&parsed_nutrition)
         .bind(confidence)
         .bind(status)
+        .bind(device_id)
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -159,6 +171,13 @@ impl OcrService {
 }
 
 const LOW_CONFIDENCE_THRESHOLD: f32 = 0.5;
+
+/// A nutrition label is a few hundred characters. These are generous ceilings
+/// on what a real pack can carry, set so one caller cannot write an unbounded
+/// blob into a table everybody reads.
+const MAX_EXTRACTED_TEXT: usize = 20_000;
+const MAX_INGREDIENTS: usize = 5_000;
+const MAX_ALLERGENS: usize = 40;
 
 /// The only nutrition keys `products.nutrition_facts` ever carries — same
 /// set `ProductService` writes for Open Food Facts products.

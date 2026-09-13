@@ -33,6 +33,27 @@ pub struct Product {
     /// Open Food Facts' most specific `categories_tags` entry, e.g.
     /// `"fruit-nectars"` — `None` for older rows and non-OFF sources.
     pub category: Option<String>,
+    /// Structured tag arrays as Open Food Facts publishes them, locale
+    /// prefix stripped. `None` is "not published", `[]` is "declared none".
+    pub allergens_tags: Option<Value>,
+    /// The "may contain" line. Its own field because a trace is a different
+    /// claim from an ingredient, and for an allergy it is the one that matters.
+    pub traces_tags: Option<Value>,
+    pub labels_tags: Option<Value>,
+    pub categories_tags: Option<Value>,
+    /// `{"sugar": "high", ...}` — theirs when published, ours from the FSA
+    /// thresholds when not.
+    pub nutrient_levels: Option<Value>,
+    pub serving_size: Option<String>,
+    pub serving_quantity: Option<f64>,
+    pub quantity: Option<String>,
+    pub nutriscore_score: Option<i32>,
+    pub ecoscore_grade: Option<String>,
+    pub completeness: Option<f32>,
+    /// When our copy was last brought in step with Open Food Facts, and
+    /// their own last-edited stamp at that moment.
+    pub off_synced_at: Option<DateTime<Utc>>,
+    pub off_last_modified: Option<i64>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -44,44 +65,106 @@ pub struct ProductResponse {
     pub country: String,
     pub product_name: String,
     pub brand: Option<String>,
+    /// Net weight as printed, e.g. `"200 g"`.
+    pub quantity: Option<String>,
     pub image_url: Option<String>,
-    pub nutrition_facts: Value,
-    pub ingredients: Option<String>,
-    pub allergens: Option<String>,
+    pub category: Option<String>,
+    pub categories: Option<Vec<String>>,
+
     pub source: String,
     pub verified: bool,
     pub verification_count: i32,
-    pub additives: Option<Value>,
+    /// How far behind Open Food Facts this copy is, and how complete their
+    /// record was when we took it (0–1, theirs).
+    pub off_synced_at: Option<DateTime<Utc>>,
+    pub completeness: Option<f32>,
+
+    /// Everything in `nutrition_facts` is per 100 g. `nutrition_per_serving`
+    /// is the same document scaled by `serving_quantity` — arithmetic only,
+    /// absent rather than guessed when the serving size is unknown.
+    pub serving_size: Option<String>,
+    pub serving_quantity: Option<f64>,
+    pub nutrition_facts: Value,
+    pub nutrition_per_serving: Option<Value>,
+    pub nutrient_levels: Option<Value>,
+
+    pub ingredients: Option<String>,
+    /// Tri-state throughout: `null` means the source doesn't publish this,
+    /// `[]` means it publishes "none". Never collapse the two.
+    pub allergens: Option<Vec<String>>,
+    /// "May contain" — a trace is not an ingredient, and for an allergy it is
+    /// the more important line.
+    pub traces: Option<Vec<String>>,
+    pub additives: Option<Vec<String>>,
+    pub labels: Option<Vec<String>>,
+
     pub nova_group: Option<i16>,
     pub nutriscore_grade: Option<String>,
+    pub nutriscore_score: Option<i32>,
+    pub ecoscore_grade: Option<String>,
+
     pub is_vegan: Option<bool>,
     pub is_vegetarian: Option<bool>,
     pub is_palm_oil_free: Option<bool>,
-    pub category: Option<String>,
+}
+
+/// A JSONB array of strings as we store it.
+fn string_list(value: &Option<Value>) -> Option<Vec<String>> {
+    let array = value.as_ref()?.as_array()?;
+    Some(array.iter().filter_map(Value::as_str).map(str::to_string).collect())
 }
 
 impl From<Product> for ProductResponse {
     fn from(product: Product) -> Self {
+        // A contributed product stores the allergens its author confirmed as
+        // one line of text; an Open Food Facts one stores tags. The client
+        // should not have to know which, so both leave here as slugs.
+        let allergens = string_list(&product.allergens_tags).or_else(|| {
+            product.allergens.as_ref().map(|text| {
+                text.split(',')
+                    .map(|part| part.trim().to_lowercase())
+                    .filter(|part| !part.is_empty())
+                    .collect()
+            })
+        });
+
+        let nutrition_per_serving = crate::services::openfoodfacts::per_serving(
+            &product.nutrition_facts,
+            product.serving_quantity,
+        );
+
         Self {
             id: product.id,
             barcode: product.barcode,
             country: product.country,
             product_name: product.product_name,
             brand: product.brand,
+            quantity: product.quantity,
             image_url: product.image_url,
-            nutrition_facts: product.nutrition_facts,
-            ingredients: product.ingredients,
-            allergens: product.allergens,
+            category: product.category,
+            categories: string_list(&product.categories_tags),
             source: product.source,
             verified: product.verified,
             verification_count: product.verification_count,
-            additives: product.additives,
+            off_synced_at: product.off_synced_at,
+            completeness: product.completeness,
+            serving_size: product.serving_size,
+            serving_quantity: product.serving_quantity,
+            nutrition_facts: product.nutrition_facts,
+            nutrition_per_serving,
+            nutrient_levels: product.nutrient_levels,
+            ingredients: product.ingredients,
+            allergens,
+            traces: string_list(&product.traces_tags),
+            additives: string_list(&product.additives),
+            labels: string_list(&product.labels_tags),
             nova_group: product.nova_group,
             nutriscore_grade: product.nutriscore_grade,
+            nutriscore_score: product.nutriscore_score,
+            ecoscore_grade: product.ecoscore_grade,
             is_vegan: product.is_vegan,
             is_vegetarian: product.is_vegetarian,
             is_palm_oil_free: product.is_palm_oil_free,
-            category: product.category,
         }
     }
 }
@@ -214,7 +297,6 @@ pub struct VerificationCandidate {
 pub struct NeedsVerificationQuery {
     #[serde(default = "default_country")]
     pub country: String,
-    pub device_id: Option<String>,
     #[serde(default = "default_verification_limit")]
     pub limit: i64,
 }

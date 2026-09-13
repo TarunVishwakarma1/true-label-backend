@@ -4,8 +4,10 @@ use crate::{
     services::cache_service::CacheService,
     services::openfoodfacts::OffClient,
 };
+use chrono::Utc;
 use serde_json::json;
 use sqlx::PgPool;
+use std::sync::Arc;
 
 /// A product's facts don't change between two scans, and the one thing that
 /// does — a verification — deletes the key itself.
@@ -16,10 +18,15 @@ const PRODUCT_TTL_SECS: usize = 3600;
 /// burns a budget shared by every user of this service.
 const MISS_TTL_SECS: usize = 600;
 
+/// How far our copy may lag Open Food Facts before the next read pays to
+/// catch it up. Long on purpose: labels change rarely, and the shared
+/// per-minute budget is better spent on barcodes nobody has scanned yet.
+const OFF_STALE_AFTER_DAYS: i64 = 30;
+
 pub struct ProductService {
     db: PgPool,
     cache: CacheService,
-    off_client: OffClient,
+    off_client: Arc<OffClient>,
 }
 
 impl ProductService {
@@ -27,7 +34,7 @@ impl ProductService {
         Self {
             db,
             cache,
-            off_client: OffClient::new(),
+            off_client: Arc::new(OffClient::new()),
         }
     }
 
@@ -74,6 +81,7 @@ impl ProductService {
 
         if let Some(p) = product {
             tracing::info!(product_id = %p.id, source = %p.source, "database hit");
+            self.refresh_if_stale(&p);
             let response = ProductResponse::from(p);
             let _ = self
                 .cache
@@ -91,105 +99,57 @@ impl ProductService {
         {
             Some(json) => {
                 let product_obj = json.get("product").ok_or(AppError::ProductNotFound)?;
+                let off = OffFields::from(product_obj);
 
-                let nutrition_facts = json!({
-                    "energy_kcal": product_obj["nutriments"].get("energy-kcal"),
-                    "protein": product_obj["nutriments"].get("proteins"),
-                    "carbs": product_obj["nutriments"].get("carbohydrates"),
-                    "fat": product_obj["nutriments"].get("fat"),
-                    "saturated_fat": product_obj["nutriments"].get("saturated-fat"),
-                    "trans_fat": product_obj["nutriments"].get("trans-fat"),
-                    "fiber": product_obj["nutriments"].get("fiber"),
-                    "sugar": product_obj["nutriments"].get("sugars"),
-                    "sodium": product_obj["nutriments"].get("sodium"),
-                    "cholesterol": product_obj["nutriments"].get("cholesterol"),
-                    "potassium": product_obj["nutriments"].get("potassium"),
-                    "calcium": product_obj["nutriments"].get("calcium"),
-                    "iron": product_obj["nutriments"].get("iron"),
-                });
-
-                let additives = extract_additives(product_obj);
-                let nova_group = product_obj.get("nova_group").and_then(|v| v.as_i64()).map(|n| n as i16);
-                let nutriscore_grade = product_obj
-                    .get("nutriscore_grade")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.trim())
-                    .filter(|s| s.len() == 1 && s.chars().all(|c| c.is_ascii_alphabetic()))
-                    .map(String::from);
-                let analysis_tags = extract_analysis_tags(product_obj);
-                let is_vegan = dietary_flag(&analysis_tags, "en:vegan", "en:non-vegan");
-                let is_vegetarian = dietary_flag(&analysis_tags, "en:vegetarian", "en:non-vegetarian");
-                let is_palm_oil_free = dietary_flag(&analysis_tags, "en:palm-oil-free", "en:palm-oil");
-                let category = extract_category(product_obj);
-
-                let id = sqlx::query_scalar::<_, uuid::Uuid>(
-                    "INSERT INTO products (barcode, country, product_name, brand, image_url, nutrition_facts, ingredients, allergens, source, additives, nova_group, nutriscore_grade, is_vegan, is_vegetarian, is_palm_oil_free, category)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                let stored = sqlx::query_as::<_, Product>(
+                    "INSERT INTO products (barcode, country, product_name, brand, quantity, image_url,
+                        nutrition_facts, nutrient_levels, serving_size, serving_quantity,
+                        ingredients, allergens_tags, traces_tags, labels_tags, categories_tags,
+                        source, additives, nova_group, nutriscore_grade, nutriscore_score,
+                        ecoscore_grade, is_vegan, is_vegetarian, is_palm_oil_free, category,
+                        completeness, off_last_modified, off_synced_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+                             'open_food_facts', $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, NOW())
                      ON CONFLICT (barcode) DO UPDATE SET updated_at = NOW()
-                     RETURNING id",
+                     RETURNING *",
                 )
                 .bind(&query.barcode)
                 .bind(&query.country)
-                .bind(product_obj.get("product_name").and_then(|v| v.as_str()).unwrap_or("Unknown"))
-                .bind(product_obj.get("brands").and_then(|v| v.as_str()))
-                .bind(product_obj.get("image_url").and_then(|v| v.as_str()))
-                .bind(&nutrition_facts)
-                .bind(product_obj.get("ingredients_text").and_then(|v| v.as_str()))
-                .bind(product_obj.get("allergens").and_then(|v| v.as_str()))
-                .bind("open_food_facts")
-                .bind(&additives)
-                .bind(nova_group)
-                .bind(&nutriscore_grade)
-                .bind(is_vegan)
-                .bind(is_vegetarian)
-                .bind(is_palm_oil_free)
-                .bind(&category)
+                .bind(&off.product_name)
+                .bind(&off.brand)
+                .bind(&off.quantity)
+                .bind(&off.image_url)
+                .bind(&off.nutrition_facts)
+                .bind(&off.nutrient_levels)
+                .bind(&off.serving_size)
+                .bind(off.serving_quantity)
+                .bind(&off.ingredients)
+                .bind(&off.allergens_tags)
+                .bind(&off.traces_tags)
+                .bind(&off.labels_tags)
+                .bind(&off.categories_tags)
+                .bind(&off.additives)
+                .bind(off.nova_group)
+                .bind(&off.nutriscore_grade)
+                .bind(off.nutriscore_score)
+                .bind(&off.ecoscore_grade)
+                .bind(off.is_vegan)
+                .bind(off.is_vegetarian)
+                .bind(off.is_palm_oil_free)
+                .bind(&off.category)
+                .bind(off.completeness)
+                .bind(off.last_modified)
                 .fetch_one(&self.db)
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?;
 
-                let response = ProductResponse {
-                    id,
-                    barcode: query.barcode.clone(),
-                    country: query.country.clone(),
-                    product_name: product_obj
-                        .get("product_name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("Unknown")
-                        .to_string(),
-                    brand: product_obj
-                        .get("brands")
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
-                    image_url: product_obj
-                        .get("image_url")
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
-                    nutrition_facts,
-                    ingredients: product_obj
-                        .get("ingredients_text")
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
-                    allergens: product_obj
-                        .get("allergens")
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
-                    source: "open_food_facts".to_string(),
-                    verified: false,
-                    verification_count: 0,
-                    additives,
-                    nova_group,
-                    nutriscore_grade,
-                    is_vegan,
-                    is_vegetarian,
-                    is_palm_oil_free,
-                    category,
-                };
+                let id = stored.id;
+                let response = ProductResponse::from(stored);
 
                 tracing::info!(
                     product_id = %id,
                     product_name = %response.product_name,
-                    additive_count = response.additives.as_ref().and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
+                    additive_count = response.additives.as_ref().map_or(0, Vec::len),
                     "created product from Open Food Facts"
                 );
 
@@ -271,6 +231,85 @@ impl ProductService {
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(ProductResponse::from(updated_product))
+    }
+
+    /// A read is the only signal we get that a product still matters, so it
+    /// is also when we check whether our copy has fallen behind Open Food
+    /// Facts. Fire-and-forget and opportunistic: the refresh gives up rather
+    /// than queue behind the rate limiter, and the reader is served our
+    /// existing row either way. Verification counts, `verified` and
+    /// `lookup_count` are ours, not theirs, and are never overwritten.
+    fn refresh_if_stale(&self, product: &Product) {
+        if product.source != "open_food_facts" {
+            return;
+        }
+        let synced = product.off_synced_at.unwrap_or(product.created_at);
+        if (Utc::now() - synced).num_days() < OFF_STALE_AFTER_DAYS {
+            return;
+        }
+
+        let db = self.db.clone();
+        let cache = self.cache.clone();
+        let off_client = Arc::clone(&self.off_client);
+        let barcode = product.barcode.clone();
+        let country = product.country.clone();
+
+        tokio::spawn(async move {
+            let Some(json) = off_client.get_product_if_free(&barcode, &country).await else {
+                return;
+            };
+            let Some(product_obj) = json.get("product") else { return };
+            let off = OffFields::from(product_obj);
+
+            let updated = sqlx::query(
+                "UPDATE products SET
+                   product_name = $2, brand = $3, quantity = $4, image_url = $5,
+                   nutrition_facts = $6, nutrient_levels = $7, serving_size = $8,
+                   serving_quantity = $9, ingredients = $10, allergens_tags = $11,
+                   traces_tags = $12, labels_tags = $13, categories_tags = $14,
+                   additives = $15, nova_group = $16, nutriscore_grade = $17,
+                   nutriscore_score = $18, ecoscore_grade = $19, is_vegan = $20,
+                   is_vegetarian = $21, is_palm_oil_free = $22, category = $23,
+                   completeness = $24, off_last_modified = $25,
+                   off_synced_at = NOW(), updated_at = NOW()
+                 WHERE barcode = $1 AND source = 'open_food_facts'",
+            )
+            .bind(&barcode)
+            .bind(&off.product_name)
+            .bind(&off.brand)
+            .bind(&off.quantity)
+            .bind(&off.image_url)
+            .bind(&off.nutrition_facts)
+            .bind(&off.nutrient_levels)
+            .bind(&off.serving_size)
+            .bind(off.serving_quantity)
+            .bind(&off.ingredients)
+            .bind(&off.allergens_tags)
+            .bind(&off.traces_tags)
+            .bind(&off.labels_tags)
+            .bind(&off.categories_tags)
+            .bind(&off.additives)
+            .bind(off.nova_group)
+            .bind(&off.nutriscore_grade)
+            .bind(off.nutriscore_score)
+            .bind(&off.ecoscore_grade)
+            .bind(off.is_vegan)
+            .bind(off.is_vegetarian)
+            .bind(off.is_palm_oil_free)
+            .bind(&off.category)
+            .bind(off.completeness)
+            .bind(off.last_modified)
+            .execute(&db)
+            .await;
+
+            match updated {
+                Ok(_) => {
+                    let _ = cache.delete(&CacheService::cache_key(&barcode, &country)).await;
+                    tracing::info!(barcode = %barcode, "refreshed from Open Food Facts");
+                }
+                Err(e) => tracing::warn!(error = %e, barcode = %barcode, "refresh failed"),
+            }
+        });
     }
 
     /// Every look-up that resolves to a product counts toward "popular near
@@ -486,6 +525,103 @@ impl ProductService {
     }
 }
 
+/// Everything we take from an Open Food Facts product, mapped once. Both the
+/// first insert and every later refresh go through here — when the mapping
+/// lived inline at the insert, the refresh had nowhere to share it from and
+/// the two would drift apart, which is the whole failure this guards against.
+pub struct OffFields {
+    pub product_name: String,
+    pub brand: Option<String>,
+    pub image_url: Option<String>,
+    pub nutrition_facts: serde_json::Value,
+    pub ingredients: Option<String>,
+    pub allergens: Option<String>,
+    pub additives: Option<serde_json::Value>,
+    pub nova_group: Option<i16>,
+    pub nutriscore_grade: Option<String>,
+    pub is_vegan: Option<bool>,
+    pub is_vegetarian: Option<bool>,
+    pub is_palm_oil_free: Option<bool>,
+    pub category: Option<String>,
+    pub categories_tags: Option<serde_json::Value>,
+    pub allergens_tags: Option<serde_json::Value>,
+    pub traces_tags: Option<serde_json::Value>,
+    pub labels_tags: Option<serde_json::Value>,
+    pub nutrient_levels: serde_json::Value,
+    pub serving_size: Option<String>,
+    pub serving_quantity: Option<f64>,
+    pub quantity: Option<String>,
+    pub nutriscore_score: Option<i32>,
+    pub ecoscore_grade: Option<String>,
+    pub completeness: Option<f32>,
+    /// Open Food Facts' own last-edited stamp, so "are we in step with them"
+    /// is answerable without re-reading the whole product.
+    pub last_modified: Option<i64>,
+}
+
+impl From<&serde_json::Value> for OffFields {
+    fn from(product_obj: &serde_json::Value) -> Self {
+        let text = |key: &str| {
+            product_obj
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        };
+        let analysis_tags = extract_analysis_tags(product_obj);
+        let nutrition_facts = crate::services::openfoodfacts::nutriments(product_obj);
+        let categories = crate::services::openfoodfacts::tags(product_obj, "categories_tags");
+        // Sugar in a bottle is judged against a different bar from sugar in a
+        // biscuit, so the drink thresholds need to know which this is.
+        let is_beverage = categories
+            .as_ref()
+            .is_some_and(|tags| tags.iter().any(|t| t.contains("beverage") || t.contains("drink")));
+        let list = |key: &str| {
+            crate::services::openfoodfacts::tags(product_obj, key).map(|tags| serde_json::json!(tags))
+        };
+
+        Self {
+            product_name: text("product_name").unwrap_or_else(|| "Unknown".to_string()),
+            brand: text("brands"),
+            image_url: text("image_url"),
+            nutrition_facts: nutrition_facts.clone(),
+            ingredients: text("ingredients_text"),
+            allergens: text("allergens"),
+            additives: extract_additives(product_obj),
+            nova_group: product_obj.get("nova_group").and_then(|v| v.as_i64()).map(|n| n as i16),
+            nutriscore_grade: text("nutriscore_grade"),
+            is_vegan: dietary_flag(&analysis_tags, "en:vegan", "en:non-vegan"),
+            is_vegetarian: dietary_flag(&analysis_tags, "en:vegetarian", "en:non-vegetarian"),
+            is_palm_oil_free: dietary_flag(&analysis_tags, "en:palm-oil-free", "en:palm-oil"),
+            category: extract_category(product_obj),
+            categories_tags: categories.as_ref().map(|tags| serde_json::json!(tags)),
+            allergens_tags: list("allergens_tags"),
+            traces_tags: list("traces_tags"),
+            labels_tags: list("labels_tags"),
+            nutrient_levels: crate::services::openfoodfacts::nutrient_levels(
+                product_obj,
+                &nutrition_facts,
+                is_beverage,
+            ),
+            serving_size: text("serving_size"),
+            serving_quantity: product_obj.get("serving_quantity").and_then(|v| match v {
+                serde_json::Value::Number(n) => n.as_f64(),
+                serde_json::Value::String(s) => s.trim().parse().ok(),
+                _ => None,
+            }),
+            quantity: text("quantity"),
+            nutriscore_score: product_obj
+                .get("nutriscore_score")
+                .and_then(|v| v.as_i64())
+                .map(|n| n as i32),
+            ecoscore_grade: text("ecoscore_grade"),
+            completeness: product_obj.get("completeness").and_then(|v| v.as_f64()).map(|v| v as f32),
+            last_modified: product_obj.get("last_modified_t").and_then(|v| v.as_i64()),
+        }
+    }
+}
+
 /// OFF tags E-numbers like `"en:e150d"` — strip the locale prefix and
 /// uppercase to the conventional `"E150D"` form. `None` (not an empty
 /// array) when the field is absent, so callers can tell "no additives" from
@@ -544,6 +680,55 @@ fn dietary_flag(tags: &[String], positive: &str, negative: &str) -> Option<bool>
 #[cfg(test)]
 mod enrichment_tests {
     use super::*;
+
+    #[test]
+    fn maps_every_column_we_store_from_one_product() {
+        let product = json!({
+            "product_name": "  Aloo Bhujia  ",
+            "brands": "Haldiram's",
+            "image_url": "https://images.example/front.jpg",
+            "nutriments": { "energy-kcal_100g": 546, "sugars": 2.4, "sodium_100g": 1.18 },
+            "ingredients_text": "Gram flour, palm oil, salt",
+            "allergens": "en:peanuts",
+            "additives_tags": ["en:e330"],
+            "nova_group": 4,
+            "nutriscore_grade": "d",
+            "ingredients_analysis_tags": ["en:vegan", "en:palm-oil"],
+            "categories_tags": ["en:snacks", "en:namkeen"],
+            "last_modified_t": 1_700_000_000
+        });
+
+        let off = OffFields::from(&product);
+        assert_eq!(off.product_name, "Aloo Bhujia");
+        assert_eq!(off.nutrition_facts["energy_kcal"], json!(546.0));
+        assert_eq!(off.nutrition_facts["sugar"], json!(2.4));
+        assert_eq!(off.nutrition_facts["sodium"], json!(1.18));
+        assert_eq!(off.additives, Some(json!(["E330"])));
+        assert_eq!(off.category.as_deref(), Some("namkeen"));
+        assert_eq!(off.is_vegan, Some(true));
+        assert_eq!(off.is_palm_oil_free, Some(false));
+        assert_eq!(off.last_modified, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn a_product_with_nothing_on_it_still_stores_every_nutrition_key() {
+        let off = OffFields::from(&json!({}));
+        // "Unknown" rather than an empty name, and thirteen nulls rather than
+        // an empty document, so the client can tell "not published" from
+        // "we failed to map it".
+        assert_eq!(off.product_name, "Unknown");
+        assert_eq!(off.nutrition_facts.as_object().unwrap().len(), 13);
+        assert!(off.nutrition_facts["fat"].is_null());
+        assert!(off.brand.is_none());
+        assert!(off.last_modified.is_none());
+    }
+
+    #[test]
+    fn a_blank_name_is_not_a_name() {
+        let off = OffFields::from(&json!({ "product_name": "   ", "brands": "" }));
+        assert_eq!(off.product_name, "Unknown");
+        assert!(off.brand.is_none());
+    }
 
     #[test]
     fn extracts_and_formats_additive_tags() {

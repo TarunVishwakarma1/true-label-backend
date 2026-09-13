@@ -12,6 +12,10 @@ pub struct Env {
     pub rust_log: String,
     /// Audience an Apple identity token must carry — this app's bundle id.
     pub apple_bundle_id: String,
+    /// Whether `X-Forwarded-For` may be believed. Only true behind a proxy
+    /// that overwrites it; otherwise any caller could hand us a fresh address
+    /// per request and lift its own rate limit.
+    pub trust_proxy_headers: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -70,6 +74,10 @@ impl Env {
         let apple_bundle_id = std::env::var("APPLE_BUNDLE_ID")
             .unwrap_or_else(|_| "com.tarun.truelable".to_string());
 
+        let trust_proxy_headers = std::env::var("TRUST_PROXY_HEADERS")
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+
         Ok(Self {
             database_url,
             redis_url,
@@ -80,6 +88,7 @@ impl Env {
             max_redis_connections,
             rust_log,
             apple_bundle_id,
+            trust_proxy_headers,
         })
     }
 

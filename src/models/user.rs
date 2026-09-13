@@ -102,6 +102,29 @@ impl From<&User> for SubscriptionResponse {
     }
 }
 
+/// Handed out once, at first launch, and never again. The token is the only
+/// copy — it is stored hashed, so it cannot be re-read or re-sent.
+#[derive(Debug, Serialize)]
+pub struct DeviceRegistration {
+    pub device_id: String,
+    pub token: String,
+}
+
+/// What this device has actually put into the catalogue. Deliberately about
+/// contribution rather than consumption: how much someone scans is their own
+/// business and never leaves their phone.
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct ContributionStats {
+    /// Labels confirmed against the pack.
+    pub confirmations: i64,
+    /// Products added from a label photo.
+    pub contributions: i64,
+    /// Of those confirmations, how many are on products that have since
+    /// crossed the threshold and are now verified for everyone.
+    pub helped_verify: i64,
+    pub member_since: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct LinkAccountRequest {
     /// Apple's signed identity token. Verified against Apple's published

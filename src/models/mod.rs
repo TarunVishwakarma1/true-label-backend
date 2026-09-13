@@ -11,7 +11,7 @@ pub use product::{
 };
 pub use response::{ApiResponse, HealthResponse, ReadinessResponse, ServiceStatus};
 pub use user::{
-    IdentityResponse, LinkAccountRequest, ProfileResponse, SubscriptionResponse,
-    UpdateProfileRequest, User,
+    ContributionStats, DeviceRegistration, IdentityResponse, LinkAccountRequest, ProfileResponse,
+    SubscriptionResponse, UpdateProfileRequest, User,
 };
 pub use verification::{Verification, VerifyProductRequest};

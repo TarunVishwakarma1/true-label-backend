@@ -1,6 +1,10 @@
 use crate::{
+    auth,
     error::{AppError, Result},
-    models::{LinkAccountRequest, ProfileResponse, SubscriptionResponse, UpdateProfileRequest, User},
+    models::{
+        ContributionStats, DeviceRegistration, LinkAccountRequest, ProfileResponse,
+        SubscriptionResponse, UpdateProfileRequest, User,
+    },
     services::AppleAuth,
 };
 use serde_json::json;
@@ -21,6 +25,28 @@ pub struct UserService {
 impl UserService {
     pub fn new(db: PgPool, apple: AppleAuth) -> Self {
         Self { db, apple }
+    }
+
+    /// The device id is ours to generate, not the client's to choose. When
+    /// the client supplied it, anyone who learned one could act as that
+    /// device; now there is nothing to guess, because the only way to hold a
+    /// row is to have been handed its token.
+    #[tracing::instrument(skip(self))]
+    pub async fn register_device(&self) -> Result<DeviceRegistration> {
+        let token = auth::new_token();
+        let device_id = uuid::Uuid::new_v4().to_string();
+
+        sqlx::query(
+            "INSERT INTO users (device_id, token_hash, token_issued_at) VALUES ($1, $2, NOW())",
+        )
+        .bind(&device_id)
+        .bind(auth::hash_token(&token))
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        tracing::info!("registered a device");
+        Ok(DeviceRegistration { device_id, token })
     }
 
     /// Reading a profile creates it if it is missing, so the client never
@@ -256,6 +282,26 @@ impl UserService {
         Ok(())
     }
 
+    /// One round trip for the three numbers, because three separate counts
+    /// on a profile screen is three chances to be half-loaded.
+    #[tracing::instrument(skip(self))]
+    pub async fn stats(&self, device_id: &str) -> Result<ContributionStats> {
+        validate_device_id(device_id)?;
+        sqlx::query_as::<_, ContributionStats>(
+            "SELECT
+               (SELECT COUNT(*) FROM verifications WHERE device_id = $1) AS confirmations,
+               (SELECT COUNT(*) FROM ocr_submissions WHERE device_id = $1) AS contributions,
+               (SELECT COUNT(*) FROM verifications v
+                  JOIN products p ON p.id = v.product_id
+                  WHERE v.device_id = $1 AND p.verified = TRUE) AS helped_verify,
+               (SELECT created_at FROM users WHERE device_id = $1) AS member_since",
+        )
+        .bind(device_id)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
+    }
+
     #[tracing::instrument(skip(self))]
     pub async fn subscription(&self, device_id: &str) -> Result<SubscriptionResponse> {
         validate_device_id(device_id)?;
@@ -384,6 +430,14 @@ mod tests {
         // without one is normal, not an error.
         assert!(signed_in.email.is_none());
         assert_eq!(signed_in.display_name.as_deref(), Some("Tarun"));
+    }
+
+    #[test]
+    fn a_registered_id_is_ours_to_issue_and_valid_to_use() {
+        // The client no longer chooses this, so whatever we mint has to pass
+        // the same validation every authenticated path applies.
+        let id = uuid::Uuid::new_v4().to_string();
+        assert!(validate_device_id(&id).is_ok());
     }
 
     #[test]

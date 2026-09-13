@@ -17,5 +17,4 @@ pub struct Verification {
 pub struct VerifyProductRequest {
     pub barcode: String,
     pub country: String,
-    pub device_id: Option<String>,
 }

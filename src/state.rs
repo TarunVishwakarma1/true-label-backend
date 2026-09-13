@@ -1,5 +1,5 @@
 use crate::config::Env;
-use crate::services::{CacheService, OcrService, ProductService};
+use crate::services::{AppleAuth, CacheService, OcrService, ProductService, UserService};
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -10,6 +10,7 @@ pub struct AppState {
     pub redis: ConnectionManager,
     pub product_service: Arc<ProductService>,
     pub ocr_service: Arc<OcrService>,
+    pub user_service: Arc<UserService>,
     pub config: Arc<Env>,
 }
 
@@ -17,13 +18,18 @@ impl AppState {
     pub async fn new(db: PgPool, redis: ConnectionManager, config: Env) -> Self {
         let cache = CacheService::new(redis.clone());
         let product_service = Arc::new(ProductService::new(db.clone(), cache));
-        let ocr_service = Arc::new(OcrService::new(db.clone()));
+        let ocr_service = Arc::new(OcrService::new(db.clone(), CacheService::new(redis.clone())));
+        let user_service = Arc::new(UserService::new(
+            db.clone(),
+            AppleAuth::new(config.apple_bundle_id.clone()),
+        ));
 
         Self {
             db,
             redis,
             product_service,
             ocr_service,
+            user_service,
             config: Arc::new(config),
         }
     }

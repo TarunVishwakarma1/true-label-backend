@@ -10,6 +10,8 @@ pub struct Env {
     pub max_db_connections: u32,
     pub max_redis_connections: u32,
     pub rust_log: String,
+    /// Audience an Apple identity token must carry — this app's bundle id.
+    pub apple_bundle_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -65,6 +67,9 @@ impl Env {
 
         let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
 
+        let apple_bundle_id = std::env::var("APPLE_BUNDLE_ID")
+            .unwrap_or_else(|_| "com.tarun.truelable".to_string());
+
         Ok(Self {
             database_url,
             redis_url,
@@ -74,6 +79,7 @@ impl Env {
             max_db_connections,
             max_redis_connections,
             rust_log,
+            apple_bundle_id,
         })
     }
 

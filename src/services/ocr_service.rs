@@ -1,6 +1,7 @@
 use crate::{
     error::{AppError, Result},
     models::{OcrResponse, SubmitLabelRequest},
+    services::cache_service::CacheService,
 };
 use serde_json::json;
 use sqlx::PgPool;
@@ -16,11 +17,12 @@ const KNOWN_ALLERGENS: &[&str] = &[
 
 pub struct OcrService {
     db: PgPool,
+    cache: CacheService,
 }
 
 impl OcrService {
-    pub fn new(db: PgPool) -> Self {
-        Self { db }
+    pub fn new(db: PgPool, cache: CacheService) -> Self {
+        Self { db, cache }
     }
 
     #[tracing::instrument(skip(self, req), fields(barcode = %req.barcode, country = %req.country))]
@@ -135,6 +137,12 @@ impl OcrService {
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // This barcode was almost certainly scanned (and missed) a moment
+        // ago — drop the negative cache entry so it resolves immediately.
+        let cache_key = CacheService::cache_key(&req.barcode, &req.country);
+        let _ = self.cache.delete(&format!("{cache_key}:miss")).await;
+        let _ = self.cache.delete(&cache_key).await;
 
         if insert_result.rows_affected() == 0 {
             tracing::info!("barcode already existed, contribution kept in review queue only");

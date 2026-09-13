@@ -1,6 +1,7 @@
 pub mod ocr;
 pub mod product;
 pub mod response;
+pub mod user;
 pub mod verification;
 
 pub use ocr::{OcrResponse, OcrSubmission, SubmitLabelRequest};
@@ -9,4 +10,8 @@ pub use product::{
     QueryProductsQuery, SearchProductQuery, TrendingQuery, VerificationCandidate,
 };
 pub use response::{ApiResponse, HealthResponse, ReadinessResponse, ServiceStatus};
+pub use user::{
+    IdentityResponse, LinkAccountRequest, ProfileResponse, SubscriptionResponse,
+    UpdateProfileRequest, User,
+};
 pub use verification::{Verification, VerifyProductRequest};

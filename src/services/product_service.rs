@@ -7,6 +7,15 @@ use crate::{
 use serde_json::json;
 use sqlx::PgPool;
 
+/// A product's facts don't change between two scans, and the one thing that
+/// does — a verification — deletes the key itself.
+const PRODUCT_TTL_SECS: usize = 3600;
+
+/// How long "Open Food Facts doesn't have this either" is remembered. Without
+/// it, re-scanning one unknown barcode hits the external API every time and
+/// burns a budget shared by every user of this service.
+const MISS_TTL_SECS: usize = 600;
+
 pub struct ProductService {
     db: PgPool,
     cache: CacheService,
@@ -48,6 +57,12 @@ impl ProductService {
         }
         tracing::debug!(cache_key = %cache_key, "cache miss");
 
+        let miss_key = format!("{cache_key}:miss");
+        if matches!(self.cache.get(&miss_key).await, Ok(Some(_))) {
+            tracing::info!("known miss, not calling Open Food Facts");
+            return Err(AppError::ProductNotFound);
+        }
+
         let product = sqlx::query_as::<_, Product>(
             "SELECT * FROM products WHERE barcode = $1 AND country = $2",
         )
@@ -62,7 +77,7 @@ impl ProductService {
             let response = ProductResponse::from(p);
             let _ = self
                 .cache
-                .set(&cache_key, &serde_json::to_string(&response).unwrap(), 300)
+                .set(&cache_key, &serde_json::to_string(&response).unwrap(), PRODUCT_TTL_SECS)
                 .await;
             self.bump_lookup(&query.barcode);
             return Ok((response, false));
@@ -109,7 +124,9 @@ impl ProductService {
 
                 let id = sqlx::query_scalar::<_, uuid::Uuid>(
                     "INSERT INTO products (barcode, country, product_name, brand, image_url, nutrition_facts, ingredients, allergens, source, additives, nova_group, nutriscore_grade, is_vegan, is_vegetarian, is_palm_oil_free, category)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING id",
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                     ON CONFLICT (barcode) DO UPDATE SET updated_at = NOW()
+                     RETURNING id",
                 )
                 .bind(&query.barcode)
                 .bind(&query.country)
@@ -178,13 +195,14 @@ impl ProductService {
 
                 let _ = self
                     .cache
-                    .set(&cache_key, &serde_json::to_string(&response).unwrap(), 300)
+                    .set(&cache_key, &serde_json::to_string(&response).unwrap(), PRODUCT_TTL_SECS)
                     .await;
                 self.bump_lookup(&query.barcode);
                 Ok((response, false))
             }
             None => {
                 tracing::info!("not found in Open Food Facts either");
+                let _ = self.cache.set(&miss_key, "1", MISS_TTL_SECS).await;
                 Err(AppError::ProductNotFound)
             }
         }
@@ -244,6 +262,7 @@ impl ProductService {
 
         let cache_key = CacheService::cache_key(barcode, country);
         let _ = self.cache.delete(&cache_key).await;
+        let _ = self.cache.delete(&format!("{cache_key}:miss")).await;
 
         let updated_product = sqlx::query_as::<_, Product>("SELECT * FROM products WHERE id = $1")
             .bind(product.id)

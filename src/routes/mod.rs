@@ -4,7 +4,7 @@ pub mod v1;
 use crate::middleware::logging_layer;
 use crate::state::AppState;
 use axum::routing::{Router, get};
-use tower_http::cors::CorsLayer;
+use tower_http::{compression::CompressionLayer, cors::CorsLayer};
 
 pub fn create_router(state: AppState) -> Router {
     Router::new()
@@ -14,6 +14,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/health/ready", get(health::readiness))
         .nest("/api/v1", v1::v1_router())
         .with_state(state)
+        .layer(CompressionLayer::new())
         .layer(CorsLayer::permissive())
         .layer(logging_layer())
 }

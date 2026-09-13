@@ -28,8 +28,8 @@ pub enum AppError {
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
 
-    #[error("Internal server error")]
-    Internal,
+    #[error("Internal server error: {0}")]
+    Internal(String),
 }
 
 impl IntoResponse for AppError {
@@ -46,7 +46,7 @@ impl IntoResponse for AppError {
             AppError::ExternalApi(_) => (StatusCode::BAD_GATEWAY, "External API error"),
             AppError::OcrFailed(_) => (StatusCode::BAD_REQUEST, "OCR processing failed"),
             AppError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, "Invalid request"),
-            AppError::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"),
+            AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"),
         };
 
         // Every error used to reach the client with zero server-side trace
@@ -93,7 +93,7 @@ mod tests {
             StatusCode::BAD_GATEWAY
         );
         assert_eq!(
-            AppError::Internal.into_response().status(),
+            AppError::Internal("boom".into()).into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
     }

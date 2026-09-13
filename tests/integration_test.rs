@@ -13,7 +13,8 @@ fn test_config() -> Env {
         max_redis_connections: 5,
         rust_log: "info".to_string(),
         apple_bundle_id: "com.tarun.truelable".to_string(),
-        trust_proxy_headers: false,
+        trusted_proxy_hops: 0,
+        allowed_origins: Vec::new(),
     }
 }
 

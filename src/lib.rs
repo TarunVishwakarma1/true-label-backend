@@ -21,6 +21,8 @@ use axum::Router;
 pub async fn build_app(config: Env) -> Result<Router, Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    config.warn_about_exposure();
+
     let db = create_pool(&config.database_url, config.max_db_connections).await?;
     run_migrations(&db).await?;
 

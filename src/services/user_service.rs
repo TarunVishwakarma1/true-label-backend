@@ -31,7 +31,7 @@ impl UserService {
     /// the client supplied it, anyone who learned one could act as that
     /// device; now there is nothing to guess, because the only way to hold a
     /// row is to have been handed its token.
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip_all)]
     pub async fn register_device(&self) -> Result<DeviceRegistration> {
         let token = auth::new_token();
         let device_id = uuid::Uuid::new_v4().to_string();
@@ -51,7 +51,7 @@ impl UserService {
 
     /// Reading a profile creates it if it is missing, so the client never
     /// needs a separate registration step — the first scan is the sign-up.
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip_all)]
     pub async fn get_or_create(&self, device_id: &str, country: &str) -> Result<ProfileResponse> {
         validate_device_id(device_id)?;
         let country = normalize_country(country)?;
@@ -72,7 +72,7 @@ impl UserService {
 
     /// Both fields are optional; absent means "leave it alone", so a client
     /// can change country without resending the whole preference list.
-    #[tracing::instrument(skip(self, req))]
+    #[tracing::instrument(skip_all)]
     pub async fn update(&self, device_id: &str, req: &UpdateProfileRequest) -> Result<ProfileResponse> {
         validate_device_id(device_id)?;
 
@@ -115,7 +115,7 @@ impl UserService {
     /// payments land, this takes a receipt, verifies it, and sets a real
     /// expiry — the column and the `source` discriminator are already here
     /// so that change doesn't move the shape of this response.
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip_all)]
     pub async fn activate_plus(&self, device_id: &str) -> Result<SubscriptionResponse> {
         validate_device_id(device_id)?;
 
@@ -138,7 +138,7 @@ impl UserService {
         Ok(SubscriptionResponse::from(&user))
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip_all)]
     pub async fn cancel_plus(&self, device_id: &str) -> Result<SubscriptionResponse> {
         validate_device_id(device_id)?;
 
@@ -163,7 +163,7 @@ impl UserService {
     /// reverts to anonymous. One active device per account — enough for an
     /// app with no cross-device sync, and it never silently duplicates
     /// entitlements.
-    #[tracing::instrument(skip(self, req))]
+    #[tracing::instrument(skip_all)]
     pub async fn link_apple(&self, device_id: &str, req: &LinkAccountRequest) -> Result<ProfileResponse> {
         validate_device_id(device_id)?;
         let claims = self.apple.verify(&req.identity_token).await?;
@@ -247,7 +247,7 @@ impl UserService {
     /// Signing out detaches the identity and keeps the device row, so the
     /// app keeps working and nothing is destroyed. Deleting the account is a
     /// separate, explicit action.
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip_all)]
     pub async fn unlink(&self, device_id: &str) -> Result<ProfileResponse> {
         validate_device_id(device_id)?;
         let user = sqlx::query_as::<_, User>(
@@ -270,7 +270,7 @@ impl UserService {
     /// Verifications this device submitted are left alone: they carry no
     /// identity beyond the device id and removing them would silently
     /// unverify products other people rely on.
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip_all)]
     pub async fn delete_account(&self, device_id: &str) -> Result<()> {
         validate_device_id(device_id)?;
         sqlx::query("DELETE FROM users WHERE device_id = $1")
@@ -284,7 +284,7 @@ impl UserService {
 
     /// One round trip for the three numbers, because three separate counts
     /// on a profile screen is three chances to be half-loaded.
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip_all)]
     pub async fn stats(&self, device_id: &str) -> Result<ContributionStats> {
         validate_device_id(device_id)?;
         sqlx::query_as::<_, ContributionStats>(
@@ -302,7 +302,7 @@ impl UserService {
         .map_err(|e| AppError::Database(e.to_string()))
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip_all)]
     pub async fn subscription(&self, device_id: &str) -> Result<SubscriptionResponse> {
         validate_device_id(device_id)?;
         let profile = self.get_or_create(device_id, "IN").await?;

@@ -45,6 +45,10 @@ impl OffClient {
     pub fn new() -> Self {
         let client = Client::builder()
             .user_agent("TrueLabel/0.1.0 (+https://truelabel.app)")
+            // Without this a hung connection to Open Food Facts holds one of
+            // our requests, and its database handle, indefinitely.
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
             .build()
             .unwrap();
 

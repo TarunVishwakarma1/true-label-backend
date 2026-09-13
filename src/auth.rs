@@ -93,35 +93,53 @@ impl FromRequestParts<AppState> for ClientIp {
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
-        Ok(ClientIp(client_ip(parts, state.config.trust_proxy_headers)))
+        Ok(ClientIp(client_ip(parts, state.config.trusted_proxy_hops)))
     }
 }
 
 /// Who to rate-limit when nobody is authenticated.
 ///
-/// The socket's peer address is the only thing a caller cannot forge, so it
-/// is the default. `X-Forwarded-For` is trusted only when `TRUST_PROXY_HEADERS`
-/// says we sit behind a proxy that overwrites it — otherwise any client could
-/// hand us a different address per request and lift its own limit.
-pub fn client_ip(parts: &Parts, trust_proxy: bool) -> String {
-    if trust_proxy
-        && let Some(forwarded) = parts
-            .headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next())
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-        && forwarded.parse::<IpAddr>().is_ok()
-    {
-        return forwarded.to_string();
+/// `X-Forwarded-For` is a list each proxy appends to, so **everything to the
+/// left of what our own proxies added is written by the caller**. Reading the
+/// leftmost entry — the obvious thing, and what this did first — means a
+/// client sends `X-Forwarded-For: <anything>` and picks its own rate-limit
+/// bucket on every request. Trusting the header at all is only safe if you
+/// know how many hops of it are yours.
+///
+/// So `hops` is the number of proxies in front of this process
+/// (`TRUSTED_PROXY_HOPS`), and the client is the entry that many places from
+/// the right — the address our outermost trusted proxy actually observed.
+/// Zero, the default, ignores the header entirely and uses the socket's peer
+/// address, which no caller can forge.
+pub fn client_ip(parts: &Parts, hops: usize) -> String {
+    let peer = || {
+        parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ConnectInfo(addr)| addr.ip().to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+
+    if hops == 0 {
+        return peer();
     }
 
-    parts
-        .extensions
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ConnectInfo(addr)| addr.ip().to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+    let Some(forwarded) = parts.headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) else {
+        return peer();
+    };
+    let entries: Vec<&str> = forwarded.split(',').map(str::trim).filter(|e| !e.is_empty()).collect();
+
+    // Fewer entries than hops means the header did not come through the
+    // proxies we expect. Trusting it then would be trusting the caller.
+    let Some(index) = entries.len().checked_sub(hops) else {
+        tracing::warn!(entries = entries.len(), hops, "forwarded header shorter than the trusted hop count");
+        return peer();
+    };
+
+    match entries.get(index).and_then(|e| e.parse::<IpAddr>().ok()) {
+        Some(ip) => ip.to_string(),
+        None => peer(),
+    }
 }
 
 #[cfg(test)]
@@ -168,27 +186,42 @@ mod tests {
         assert!(bearer(&parts_with(None)).is_none());
     }
 
-    #[test]
-    fn a_forwarded_address_is_ignored_unless_we_sit_behind_a_proxy() {
+    fn forwarded(value: &str) -> Parts {
         let mut request = Request::new(());
         request
             .headers_mut()
-            .insert("x-forwarded-for", HeaderValue::from_static("203.0.113.9, 10.0.0.1"));
-        let parts = request.into_parts().0;
-
-        // Without a trusted proxy this is caller-supplied text, and honouring
-        // it would let anyone raise their own limit by changing one header.
-        assert_eq!(client_ip(&parts, false), "unknown");
-        assert_eq!(client_ip(&parts, true), "203.0.113.9");
+            .insert("x-forwarded-for", HeaderValue::from_str(value).unwrap());
+        request.into_parts().0
     }
 
     #[test]
-    fn a_forwarded_header_that_is_not_an_address_is_refused() {
-        let mut request = Request::new(());
-        request
-            .headers_mut()
-            .insert("x-forwarded-for", HeaderValue::from_static("not-an-ip"));
-        let parts = request.into_parts().0;
-        assert_eq!(client_ip(&parts, true), "unknown");
+    fn a_caller_cannot_choose_its_own_rate_limit_bucket() {
+        // One proxy in front. It appended 203.0.113.9, the address it really
+        // saw. Everything left of that is text the caller sent, and picking
+        // the leftmost entry would hand them a fresh bucket per request.
+        let spoofed = forwarded("1.1.1.1, 2.2.2.2, 203.0.113.9");
+        assert_eq!(client_ip(&spoofed, 1), "203.0.113.9");
+
+        // Two proxies: ours appended 10.0.0.1, the one in front of it
+        // appended the real client.
+        let two = forwarded("9.9.9.9, 203.0.113.9, 10.0.0.1");
+        assert_eq!(client_ip(&two, 2), "203.0.113.9");
+    }
+
+    #[test]
+    fn zero_hops_ignores_the_header_entirely() {
+        assert_eq!(client_ip(&forwarded("203.0.113.9"), 0), "unknown");
+        assert_eq!(client_ip(&parts_with(None), 0), "unknown");
+    }
+
+    #[test]
+    fn a_header_shorter_than_our_hops_is_not_from_our_proxies() {
+        // Somebody reaching the process directly, past the ingress.
+        assert_eq!(client_ip(&forwarded("203.0.113.9"), 2), "unknown");
+    }
+
+    #[test]
+    fn a_forwarded_entry_that_is_not_an_address_is_refused() {
+        assert_eq!(client_ip(&forwarded("not-an-ip"), 1), "unknown");
     }
 }

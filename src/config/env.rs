@@ -12,10 +12,14 @@ pub struct Env {
     pub rust_log: String,
     /// Audience an Apple identity token must carry — this app's bundle id.
     pub apple_bundle_id: String,
-    /// Whether `X-Forwarded-For` may be believed. Only true behind a proxy
-    /// that overwrites it; otherwise any caller could hand us a fresh address
-    /// per request and lift its own rate limit.
-    pub trust_proxy_headers: bool,
+    /// How many proxies sit in front of this process. `X-Forwarded-For` is
+    /// only meaningful if you know this: everything left of what your own
+    /// proxies appended is written by the caller. Zero ignores the header.
+    pub trusted_proxy_hops: usize,
+    /// Browser origins allowed to call this API. Empty means none — a native
+    /// client sends no `Origin`, so an empty list costs the app nothing and
+    /// stops the API being used as somebody else's free backend.
+    pub allowed_origins: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -74,9 +78,18 @@ impl Env {
         let apple_bundle_id = std::env::var("APPLE_BUNDLE_ID")
             .unwrap_or_else(|_| "com.tarun.truelable".to_string());
 
-        let trust_proxy_headers = std::env::var("TRUST_PROXY_HEADERS")
-            .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
+        let trusted_proxy_hops = std::env::var("TRUSTED_PROXY_HOPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+
+        let allowed_origins = std::env::var("ALLOWED_ORIGINS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|o| !o.is_empty())
+            .map(String::from)
+            .collect();
 
         Ok(Self {
             database_url,
@@ -88,8 +101,44 @@ impl Env {
             max_redis_connections,
             rust_log,
             apple_bundle_id,
-            trust_proxy_headers,
+            trusted_proxy_hops,
+            allowed_origins,
         })
+    }
+
+    /// Shouted at boot, because both halves of this are silent failures.
+    ///
+    /// Behind a reverse proxy every request arrives from the proxy, so the
+    /// peer address is the same for everybody. With `TRUSTED_PROXY_HOPS` left
+    /// at 0 the whole internet then shares one rate-limit bucket and the API
+    /// starts refusing everyone within minutes of any real traffic.
+    ///
+    /// The opposite pairing is worse. A non-zero hop count says "a proxy in
+    /// front appended the last entry of X-Forwarded-For". If the process also
+    /// listens on a public interface, anyone reaching that port directly
+    /// writes the whole header themselves and picks their own bucket — the
+    /// rate limits stop meaning anything. Bind to loopback, or make sure a
+    /// firewall does the same job.
+    pub fn warn_about_exposure(&self) {
+        let loopback = self
+            .server_host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false);
+
+        if self.trusted_proxy_hops > 0 && !loopback {
+            tracing::error!(
+                host = %self.server_host,
+                hops = self.trusted_proxy_hops,
+                "TRUSTED_PROXY_HOPS is set but this process is listening on a public                  interface. Anyone who reaches it directly can forge X-Forwarded-For and                  bypass every rate limit. Bind SERVER_HOST to 127.0.0.1, or firewall the port."
+            );
+        }
+
+        if self.trusted_proxy_hops == 0 && loopback {
+            tracing::error!(
+                "Listening on loopback means a reverse proxy is in front, but                  TRUSTED_PROXY_HOPS is 0 — so every request looks like it came from the                  proxy and the whole internet shares one rate-limit bucket. Set it to the                  number of proxies that append to X-Forwarded-For (nginx alone: 1)."
+            );
+        }
     }
 
     pub fn socket_addr(&self) -> SocketAddr {

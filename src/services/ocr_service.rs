@@ -34,7 +34,20 @@ impl OcrService {
             return Err(AppError::InvalidRequest("Ingredients cannot be empty".to_string()));
         }
 
-        let guessed_name = guess_product_name(&req.extracted_text);
+        let guessed_name = req
+            .product_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(|n| n.chars().take(255).collect::<String>())
+            .unwrap_or_else(|| guess_product_name(&req.extracted_text));
+        let brand = req
+            .brand
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .map(|b| b.chars().take(255).collect::<String>());
+        let nutrition = sanitize_nutrition(req.nutrition.as_ref());
         let ocr_ingredients = parse_ingredients(&req.extracted_text);
         let ocr_allergens = detect_allergens(&req.extracted_text);
         let confidence = ingredient_overlap_ratio(&ocr_ingredients, &req.reviewed_ingredients);
@@ -64,6 +77,8 @@ impl OcrService {
 
         let parsed_nutrition = json!({
             "guessed_name": guessed_name,
+            "brand": brand,
+            "nutrition": nutrition,
             "ingredients": req.reviewed_ingredients,
             "allergens": req.reviewed_allergens,
             "ocr_parsed_ingredients": ocr_ingredients,
@@ -106,15 +121,17 @@ impl OcrService {
             &guessed_name
         };
         let insert_result = sqlx::query(
-            "INSERT INTO products (barcode, country, product_name, ingredients, allergens, nutrition_facts, source, verified, verification_count)
-             VALUES ($1, $2, $3, $4, $5, '{}'::jsonb, 'user_contributed', false, 0)
+            "INSERT INTO products (barcode, country, product_name, brand, ingredients, allergens, nutrition_facts, source, verified, verification_count)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'user_contributed', false, 0)
              ON CONFLICT (barcode) DO NOTHING",
         )
         .bind(&req.barcode)
         .bind(&req.country)
         .bind(product_name)
+        .bind(&brand)
         .bind(&req.reviewed_ingredients)
         .bind(&allergens_text)
+        .bind(&nutrition)
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -134,6 +151,31 @@ impl OcrService {
 }
 
 const LOW_CONFIDENCE_THRESHOLD: f32 = 0.5;
+
+/// The only nutrition keys `products.nutrition_facts` ever carries — same
+/// set `ProductService` writes for Open Food Facts products.
+const NUTRITION_KEYS: &[&str] = &[
+    "energy_kcal", "protein", "carbs", "fat", "saturated_fat", "trans_fat", "fiber",
+    "sugar", "sodium", "cholesterol", "potassium", "calcium", "iron",
+];
+
+/// Keep only known keys with finite, non-negative, plausible per-100g
+/// numbers. A client typo ("sugar": 2400) is dropped rather than stored as
+/// truth; an unknown key is dropped rather than polluting the schema.
+fn sanitize_nutrition(input: Option<&serde_json::Value>) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    if let Some(obj) = input.and_then(|v| v.as_object()) {
+        for key in NUTRITION_KEYS {
+            if let Some(n) = obj.get(*key).and_then(|v| v.as_f64())
+                && n.is_finite()
+                && (0.0..=1000.0).contains(&n)
+            {
+                out.insert((*key).to_string(), json!(n));
+            }
+        }
+    }
+    serde_json::Value::Object(out)
+}
 
 /// Fraction of the ingredients OCR actually found (from the untouched raw
 /// text) that also appear in what the user ultimately submitted. Deliberately
@@ -254,6 +296,14 @@ fn capitalize(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitizes_nutrition_to_known_plausible_keys() {
+        let input = json!({"sugar": 12.5, "sodium": -1, "energy_kcal": 546, "unicorn": 3, "fat": "9"});
+        let out = sanitize_nutrition(Some(&input));
+        assert_eq!(out, json!({"sugar": 12.5, "energy_kcal": 546.0}));
+        assert_eq!(sanitize_nutrition(None), json!({}));
+    }
 
     #[test]
     fn parses_comma_separated_ingredients_after_label() {

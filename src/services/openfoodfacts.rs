@@ -1,4 +1,5 @@
 use crate::error::{AppError, Result};
+use crate::models::ProductCard;
 use governor::{Quota, RateLimiter};
 use reqwest::Client;
 use serde_json::Value;
@@ -26,10 +27,17 @@ const DEFAULT_MAX_REQUESTS_PER_MINUTE: u32 = 12;
 /// doesn't hang indefinitely under sustained heavy load.
 const RATE_LIMIT_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// OFF's search endpoint has a separate, tighter budget (10/min per IP).
+/// Searches never queue behind it — a throttled search just returns nothing
+/// from OFF and the caller shows local results.
+const SEARCH_REQUESTS_PER_MINUTE: u32 = 8;
+
 pub struct OffClient {
     client: Client,
     base_url: String,
+    search_url: String,
     rate_limiter: OffRateLimiter,
+    search_limiter: OffRateLimiter,
 }
 
 impl OffClient {
@@ -48,8 +56,53 @@ impl OffClient {
         Self {
             client,
             base_url: "https://world.openfoodfacts.org/api/v3".to_string(),
+            search_url: "https://world.openfoodfacts.org/cgi/search.pl".to_string(),
             rate_limiter: RateLimiter::direct(Quota::per_minute(requests_per_minute)),
+            search_limiter: RateLimiter::direct(Quota::per_minute(
+                NonZeroU32::new(SEARCH_REQUESTS_PER_MINUTE).unwrap(),
+            )),
         }
+    }
+
+    /// Free-text product search. Returns an empty list (not an error) when
+    /// the search budget is spent, so callers never block on it.
+    #[tracing::instrument(skip(self))]
+    pub async fn search(&self, term: &str) -> Result<Vec<ProductCard>> {
+        if self.search_limiter.check().is_err() {
+            tracing::warn!("search rate limit reached, skipping Open Food Facts");
+            return Ok(Vec::new());
+        }
+
+        let url = reqwest::Url::parse_with_params(
+            &self.search_url,
+            &[
+                ("search_terms", term),
+                ("search_simple", "1"),
+                ("action", "process"),
+                ("json", "1"),
+                ("page_size", "10"),
+                ("fields", "code,product_name,brands,image_url,nutriscore_grade,nova_group,nutriments"),
+            ],
+        )
+        .map_err(|e| AppError::ExternalApi(e.to_string()))?;
+
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| AppError::ExternalApi(e.to_string()))?;
+
+        if !response.status().is_success() {
+            return Err(AppError::ExternalApi(format!("HTTP {}", response.status())));
+        }
+
+        let json: Value = response
+            .json()
+            .await
+            .map_err(|e| AppError::ExternalApi(e.to_string()))?;
+
+        Ok(parse_search_results(&json))
     }
 
     #[tracing::instrument(skip(self), fields(barcode = %barcode, country = %country))]
@@ -108,6 +161,39 @@ impl OffClient {
     }
 }
 
+/// Pull the card fields out of OFF's search payload. Entries without a code
+/// or a name are useless as cards and are dropped.
+fn parse_search_results(json: &Value) -> Vec<ProductCard> {
+    let Some(products) = json.get("products").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    products
+        .iter()
+        .filter_map(|p| {
+            let barcode = p.get("code")?.as_str()?.to_string();
+            let name = p.get("product_name")?.as_str()?.trim().to_string();
+            if name.is_empty() || barcode.len() < 8 || barcode.len() > 14 {
+                return None;
+            }
+            let nutriments = p.get("nutriments").cloned().unwrap_or(Value::Null);
+            let num = |key: &str| nutriments.get(key).and_then(Value::as_f64);
+            Some(ProductCard {
+                barcode,
+                product_name: name,
+                brand: p.get("brands").and_then(Value::as_str).map(str::to_string),
+                image_url: p.get("image_url").and_then(Value::as_str).map(str::to_string),
+                nutriscore_grade: p.get("nutriscore_grade").and_then(Value::as_str).map(str::to_string),
+                nova_group: p.get("nova_group").and_then(Value::as_i64).map(|n| n as i16),
+                verified: false,
+                energy_kcal: num("energy-kcal_100g"),
+                sugar: num("sugars_100g"),
+                sodium: num("sodium_100g"),
+                sort_value: None,
+            })
+        })
+        .collect()
+}
+
 impl Default for OffClient {
     fn default() -> Self {
         Self::new()
@@ -117,6 +203,21 @@ impl Default for OffClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_search_results_and_drops_junk() {
+        let json = serde_json::json!({"products": [
+            {"code": "8901030895564", "product_name": "Aloo Bhujia", "brands": "Haldiram's",
+             "nutriscore_grade": "d", "nova_group": 4, "nutriments": {"energy-kcal_100g": 546, "sugars_100g": 2.4}},
+            {"code": "123", "product_name": "Too short"},
+            {"code": "8901030895565", "product_name": "   "}
+        ]});
+        let cards = parse_search_results(&json);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].product_name, "Aloo Bhujia");
+        assert_eq!(cards[0].energy_kcal, Some(546.0));
+        assert_eq!(cards[0].nova_group, Some(4));
+    }
 
     #[test]
     fn rate_limiter_throttles_once_quota_is_exhausted() {

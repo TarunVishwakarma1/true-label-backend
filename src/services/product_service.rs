@@ -1,6 +1,6 @@
 use crate::{
     error::{AppError, Result},
-    models::{Product, ProductResponse, ProductSummary, SearchProductQuery, VerificationCandidate},
+    models::{CardRow, Product, ProductCard, ProductResponse, SearchProductQuery, VerificationCandidate},
     services::cache_service::CacheService,
     services::openfoodfacts::OffClient,
 };
@@ -43,6 +43,7 @@ impl ProductService {
             && let Ok(product) = serde_json::from_str::<ProductResponse>(&cached)
         {
             tracing::info!(cache_key = %cache_key, "cache hit");
+            self.bump_lookup(&query.barcode);
             return Ok((product, true));
         }
         tracing::debug!(cache_key = %cache_key, "cache miss");
@@ -63,6 +64,7 @@ impl ProductService {
                 .cache
                 .set(&cache_key, &serde_json::to_string(&response).unwrap(), 300)
                 .await;
+            self.bump_lookup(&query.barcode);
             return Ok((response, false));
         }
         tracing::info!("not in database, fetching from Open Food Facts");
@@ -96,6 +98,8 @@ impl ProductService {
                 let nutriscore_grade = product_obj
                     .get("nutriscore_grade")
                     .and_then(|v| v.as_str())
+                    .map(|s| s.trim())
+                    .filter(|s| s.len() == 1 && s.chars().all(|c| c.is_ascii_alphabetic()))
                     .map(String::from);
                 let analysis_tags = extract_analysis_tags(product_obj);
                 let is_vegan = dietary_flag(&analysis_tags, "en:vegan", "en:non-vegan");
@@ -176,6 +180,7 @@ impl ProductService {
                     .cache
                     .set(&cache_key, &serde_json::to_string(&response).unwrap(), 300)
                     .await;
+                self.bump_lookup(&query.barcode);
                 Ok((response, false))
             }
             None => {
@@ -249,25 +254,32 @@ impl ProductService {
         Ok(ProductResponse::from(updated_product))
     }
 
-    /// Same-category products, cheapest-first on whichever nutrient the
-    /// caller's health profile is watching. Products without a `category`
-    /// (older rows, non-OFF sources) never appear here — an unmatched shelf
-    /// beats a wrong one. Empty is a legitimate answer, not an error: the
-    /// caller shows nothing rather than a fabricated suggestion.
+    /// Every look-up that resolves to a product counts toward "popular near
+    /// you". Fire-and-forget: a lost increment is nothing, a slow one on
+    /// the scan path would be felt.
+    fn bump_lookup(&self, barcode: &str) {
+        let db = self.db.clone();
+        let barcode = barcode.to_string();
+        tokio::spawn(async move {
+            let _ = sqlx::query("UPDATE products SET lookup_count = lookup_count + 1 WHERE barcode = $1")
+                .bind(barcode)
+                .execute(&db)
+                .await;
+        });
+    }
+
+    /// Same-category products ranked on one nutrient (or on overall
+    /// grade). Products without a `category` never appear — an unmatched
+    /// shelf beats a wrong one. Empty is a legitimate answer.
     #[tracing::instrument(skip(self), fields(barcode = %barcode, country = %country, sort_by = %sort_by))]
     pub async fn find_alternatives(
         &self,
         barcode: &str,
         country: &str,
         sort_by: &str,
-    ) -> Result<Vec<ProductSummary>> {
-        let sort_key = match sort_by {
-            "sugar" | "sodium" => sort_by,
-            _ => {
-                tracing::warn!("unrecognized sort_by, defaulting to sugar");
-                "sugar"
-            }
-        };
+        limit: i64,
+    ) -> Result<Vec<ProductCard>> {
+        let limit = limit.clamp(1, 10);
 
         let product = sqlx::query_as::<_, Product>(
             "SELECT * FROM products WHERE barcode = $1 AND country = $2",
@@ -283,32 +295,126 @@ impl ProductService {
             return Ok(Vec::new());
         };
 
-        // sort_key is interpolated, not bound — but it's provably one of
-        // only two hardcoded literals ("sugar"/"sodium") from the match
-        // above, never the caller's raw input, so there's no injection
-        // surface despite the string-building.
-        let rows: Vec<(String, String, Option<f64>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "SELECT barcode, product_name, (nutrition_facts->>'{sort_key}')::float8 AS sort_value
+        // Only these literals are ever interpolated — never the caller's
+        // raw string — so the format! below has no injection surface.
+        let (sort_expr, order) = match sort_by {
+            "sugar" | "sodium" | "fat" | "saturated_fat" | "energy_kcal" | "carbs" => {
+                (format!("(nutrition_facts->>'{sort_by}')::float8"), "sort_value ASC NULLS LAST")
+            }
+            "protein" | "fiber" => {
+                (format!("(nutrition_facts->>'{sort_by}')::float8"), "sort_value DESC NULLS LAST")
+            }
+            "score" => ("NULL::float8".to_string(), "nutriscore_grade ASC NULLS LAST, nova_group ASC NULLS LAST"),
+            _ => {
+                tracing::warn!("unrecognized sort_by, defaulting to sugar");
+                ("(nutrition_facts->>'sugar')::float8".to_string(), "sort_value ASC NULLS LAST")
+            }
+        };
+
+        let rows: Vec<CardRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT barcode, product_name, brand, image_url, nutriscore_grade, nova_group,
+                    COALESCE(verified, false), nutrition_facts, {sort_expr} AS sort_value
              FROM products
              WHERE category = $1 AND country = $2 AND barcode != $3
-             ORDER BY sort_value ASC NULLS LAST
-             LIMIT 3"
+             ORDER BY {order}, lookup_count DESC
+             LIMIT $4"
         )))
         .bind(&category)
         .bind(country)
         .bind(barcode)
+        .bind(limit)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        Ok(rows
-            .into_iter()
-            .map(|(barcode, product_name, sort_value)| ProductSummary {
-                barcode,
-                product_name,
-                sort_value,
-            })
-            .collect())
+        Ok(rows.into_iter().map(ProductCard::from).collect())
+    }
+
+    /// Free-text search over what we already know (trigram-ranked), topped
+    /// up from Open Food Facts when the local shelf is thin. The OFF call
+    /// never waits on a rate-limit slot — a thin local result beats a slow
+    /// one. Cached briefly since people retype the same few things.
+    #[tracing::instrument(skip(self), fields(country = %country))]
+    pub async fn query_products(&self, q: &str, country: &str, limit: i64) -> Result<(Vec<ProductCard>, bool)> {
+        let term = q.trim();
+        if term.chars().count() < 2 || term.chars().count() > 60 {
+            return Err(AppError::InvalidRequest("query must be 2–60 characters".to_string()));
+        }
+        if country.len() != 2 {
+            return Err(AppError::InvalidCountry);
+        }
+        let limit = limit.clamp(1, 40);
+        let cache_key = format!("search:{}:{}:{limit}", country.to_uppercase(), term.to_lowercase());
+
+        if let Ok(Some(cached)) = self.cache.get(&cache_key).await
+            && let Ok(cards) = serde_json::from_str::<Vec<ProductCard>>(&cached)
+        {
+            return Ok((cards, true));
+        }
+
+        let rows: Vec<CardRow> = sqlx::query_as(
+            "SELECT barcode, product_name, brand, image_url, nutriscore_grade, nova_group,
+                    COALESCE(verified, false), nutrition_facts, NULL::float8
+             FROM products
+             WHERE country = $1
+               AND (product_name ILIKE $2 OR brand ILIKE $2 OR barcode = $3
+                    OR similarity(product_name, $3) > 0.3)
+             ORDER BY GREATEST(similarity(product_name, $3), similarity(COALESCE(brand, ''), $3)) DESC,
+                      lookup_count DESC
+             LIMIT $4",
+        )
+        .bind(country)
+        .bind(format!("%{term}%"))
+        .bind(term)
+        .bind(limit)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let mut cards: Vec<ProductCard> = rows.into_iter().map(ProductCard::from).collect();
+
+        if cards.len() < 5 {
+            match self.off_client.search(term).await {
+                Ok(remote) => {
+                    for card in remote {
+                        if cards.len() as i64 >= limit {
+                            break;
+                        }
+                        if !cards.iter().any(|c| c.barcode == card.barcode) {
+                            cards.push(card);
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "Open Food Facts search failed, returning local results only"),
+            }
+        }
+
+        let _ = self
+            .cache
+            .set(&cache_key, &serde_json::to_string(&cards).unwrap(), 600)
+            .await;
+        Ok((cards, false))
+    }
+
+    /// Most looked-up products in a country. Falls through to newest when
+    /// nothing has been looked up yet, so a fresh deployment isn't blank.
+    #[tracing::instrument(skip(self), fields(country = %country))]
+    pub async fn trending(&self, country: &str, limit: i64) -> Result<Vec<ProductCard>> {
+        let rows: Vec<CardRow> = sqlx::query_as(
+            "SELECT barcode, product_name, brand, image_url, nutriscore_grade, nova_group,
+                    COALESCE(verified, false), nutrition_facts, NULL::float8
+             FROM products
+             WHERE country = $1 AND product_name <> 'Unknown'
+             ORDER BY lookup_count DESC, verification_count DESC, created_at DESC
+             LIMIT $2",
+        )
+        .bind(country)
+        .bind(limit.clamp(1, 30))
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(rows.into_iter().map(ProductCard::from).collect())
     }
 
     /// Feeds the Verify tab's queue: products this device hasn't already
@@ -323,8 +429,8 @@ impl ProductService {
         device_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<VerificationCandidate>> {
-        let rows: Vec<(String, String, Option<String>, serde_json::Value, i32)> = sqlx::query_as(
-            "SELECT barcode, product_name, brand, nutrition_facts, verification_count
+        let rows: Vec<(String, String, Option<String>, Option<String>, Option<String>, serde_json::Value, i32)> = sqlx::query_as(
+            "SELECT barcode, product_name, brand, image_url, nutriscore_grade, nutrition_facts, verification_count
              FROM products
              WHERE country = $1 AND verification_count < 3
                AND ($2::text IS NULL OR NOT EXISTS (
@@ -344,11 +450,13 @@ impl ProductService {
 
         Ok(rows
             .into_iter()
-            .map(|(barcode, product_name, brand, nutrition_facts, verification_count)| {
+            .map(|(barcode, product_name, brand, image_url, nutriscore_grade, nutrition_facts, verification_count)| {
                 VerificationCandidate {
                     barcode,
                     product_name,
                     brand,
+                    image_url,
+                    nutriscore_grade,
                     energy_kcal: nutrition_facts.get("energy_kcal").and_then(|v| v.as_f64()),
                     sugar: nutrition_facts.get("sugar").and_then(|v| v.as_f64()),
                     sodium: nutrition_facts.get("sodium").and_then(|v| v.as_f64()),

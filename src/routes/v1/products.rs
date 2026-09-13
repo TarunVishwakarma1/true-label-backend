@@ -10,4 +10,6 @@ pub fn products_router() -> Router<AppState> {
         .route("/verify", post(crate::handlers::products::verify_product))
         .route("/alternatives", get(crate::handlers::products::alternatives))
         .route("/needs-verification", get(crate::handlers::products::needs_verification))
+        .route("/query", get(crate::handlers::products::query_products))
+        .route("/trending", get(crate::handlers::products::trending))
 }

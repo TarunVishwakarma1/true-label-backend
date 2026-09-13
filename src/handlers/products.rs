@@ -1,8 +1,9 @@
 use crate::{
     error::Result,
     models::{
-        AlternativesQuery, ApiResponse, NeedsVerificationQuery, ProductResponse, ProductSummary,
-        SearchProductQuery, VerificationCandidate, VerifyProductRequest,
+        AlternativesQuery, ApiResponse, NeedsVerificationQuery, ProductCard, ProductResponse,
+        QueryProductsQuery, SearchProductQuery, TrendingQuery, VerificationCandidate,
+        VerifyProductRequest,
     },
     state::AppState,
 };
@@ -34,12 +35,34 @@ pub async fn verify_product(
 pub async fn alternatives(
     State(state): State<AppState>,
     Query(query): Query<AlternativesQuery>,
-) -> Result<Json<ApiResponse<Vec<ProductSummary>>>> {
+) -> Result<Json<ApiResponse<Vec<ProductCard>>>> {
     let alternatives = state
         .product_service
-        .find_alternatives(&query.barcode, &query.country, &query.sort_by)
+        .find_alternatives(&query.barcode, &query.country, &query.sort_by, query.limit)
         .await?;
     Ok(Json(ApiResponse::success(alternatives, false)))
+}
+
+pub async fn query_products(
+    State(state): State<AppState>,
+    Query(query): Query<QueryProductsQuery>,
+) -> Result<Json<ApiResponse<Vec<ProductCard>>>> {
+    let (cards, cached) = state
+        .product_service
+        .query_products(&query.q, &query.country, query.limit)
+        .await?;
+    Ok(Json(ApiResponse::success(cards, cached)))
+}
+
+pub async fn trending(
+    State(state): State<AppState>,
+    Query(query): Query<TrendingQuery>,
+) -> Result<Json<ApiResponse<Vec<ProductCard>>>> {
+    let cards = state
+        .product_service
+        .trending(&query.country, query.limit)
+        .await?;
+    Ok(Json(ApiResponse::success(cards, false)))
 }
 
 pub async fn needs_verification(

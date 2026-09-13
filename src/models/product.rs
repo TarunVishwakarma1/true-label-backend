@@ -86,14 +86,72 @@ impl From<Product> for ProductResponse {
     }
 }
 
-/// Just enough to render the "same shelf" line — not a full product payload.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ProductSummary {
+/// Enough to draw a product card anywhere a list of products appears
+/// (search results, trending, same-shelf alternatives) — not a full
+/// payload. Tapping one goes through the normal `search` look-up.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProductCard {
     pub barcode: String,
     pub product_name: String,
-    /// The value of whichever nutrient `sort_by` asked for, grams per 100g
-    /// (matches how `nutrition_facts` stores every nutrient already).
+    pub brand: Option<String>,
+    pub image_url: Option<String>,
+    pub nutriscore_grade: Option<String>,
+    pub nova_group: Option<i16>,
+    pub verified: bool,
+    pub energy_kcal: Option<f64>,
+    pub sugar: Option<f64>,
+    pub sodium: Option<f64>,
+    /// For alternatives: the value of whichever nutrient `sort_by` asked
+    /// for, per 100g. `None` elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sort_value: Option<f64>,
+}
+
+impl ProductCard {
+    pub fn from_row(
+        barcode: String,
+        product_name: String,
+        brand: Option<String>,
+        image_url: Option<String>,
+        nutriscore_grade: Option<String>,
+        nova_group: Option<i16>,
+        verified: bool,
+        nutrition_facts: &Value,
+        sort_value: Option<f64>,
+    ) -> Self {
+        Self {
+            barcode,
+            product_name,
+            brand,
+            image_url,
+            nutriscore_grade,
+            nova_group,
+            verified,
+            energy_kcal: nutrition_facts.get("energy_kcal").and_then(Value::as_f64),
+            sugar: nutrition_facts.get("sugar").and_then(Value::as_f64),
+            sodium: nutrition_facts.get("sodium").and_then(Value::as_f64),
+            sort_value,
+        }
+    }
+}
+
+/// Row shape shared by every card-producing query below.
+pub type CardRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i16>,
+    bool,
+    Value,
+    Option<f64>,
+);
+
+impl From<CardRow> for ProductCard {
+    fn from(r: CardRow) -> Self {
+        ProductCard::from_row(r.0, r.1, r.2, r.3, r.4, r.5, r.6, &r.7, r.8)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,10 +161,37 @@ pub struct AlternativesQuery {
     pub country: String,
     #[serde(default = "default_sort_by")]
     pub sort_by: String,
+    #[serde(default = "default_alternatives_limit")]
+    pub limit: i64,
 }
 
 fn default_sort_by() -> String {
     "sugar".to_string()
+}
+
+fn default_alternatives_limit() -> i64 {
+    3
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QueryProductsQuery {
+    pub q: String,
+    #[serde(default = "default_country")]
+    pub country: String,
+    #[serde(default = "default_query_limit")]
+    pub limit: i64,
+}
+
+fn default_query_limit() -> i64 {
+    20
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TrendingQuery {
+    #[serde(default = "default_country")]
+    pub country: String,
+    #[serde(default = "default_verification_limit")]
+    pub limit: i64,
 }
 
 /// One card in the Verify tab's queue — enough to ask "does this look
@@ -117,6 +202,8 @@ pub struct VerificationCandidate {
     pub barcode: String,
     pub product_name: String,
     pub brand: Option<String>,
+    pub image_url: Option<String>,
+    pub nutriscore_grade: Option<String>,
     pub energy_kcal: Option<f64>,
     pub sugar: Option<f64>,
     pub sodium: Option<f64>,

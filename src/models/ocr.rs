@@ -42,4 +42,16 @@ pub struct SubmitLabelRequest {
     pub extracted_text: String,
     pub reviewed_ingredients: String,
     pub reviewed_allergens: Vec<String>,
+    /// What the user confirmed as the product's name/brand, when the client
+    /// read the front of the pack too. Both optional — older clients only
+    /// send the ingredient side.
+    #[serde(default)]
+    pub product_name: Option<String>,
+    #[serde(default)]
+    pub brand: Option<String>,
+    /// Per-100g values parsed from the nutrition table and confirmed by the
+    /// user, keyed exactly like `products.nutrition_facts` (`energy_kcal`,
+    /// `sugar`, ...). Validated server-side before it's stored.
+    #[serde(default)]
+    pub nutrition: Option<Value>,
 }

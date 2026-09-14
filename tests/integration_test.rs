@@ -17,6 +17,7 @@ fn test_config() -> Env {
         allowed_origins: Vec::new(),
         github_token: None,
         github_repo: None,
+        trust_container_network: false,
     }
 }
 

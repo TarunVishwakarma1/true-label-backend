@@ -27,6 +27,14 @@ pub struct Env {
     pub github_token: Option<String>,
     /// `owner/repo` the dashboard files crash-report issues against.
     pub github_repo: Option<String>,
+    /// `warn_about_exposure`'s loopback check assumes this process's own
+    /// bind address is what stands between it and the public internet —
+    /// true for a droplet (backend + nginx, same host), false inside a
+    /// container: a Kubernetes Service decides reachability, not the
+    /// process's interface, and `0.0.0.0` there is mandatory plumbing, not
+    /// exposure. Set when something *outside this process* — a Service
+    /// typed ClusterIP, a security group — already does that job.
+    pub trust_container_network: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -101,6 +109,10 @@ impl Env {
         let github_token = std::env::var("GITHUB_TOKEN").ok().filter(|v| !v.is_empty());
         let github_repo = std::env::var("GITHUB_REPO").ok().filter(|v| !v.is_empty());
 
+        let trust_container_network = std::env::var("TRUST_CONTAINER_NETWORK")
+            .ok()
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
+
         Ok(Self {
             database_url,
             redis_url,
@@ -115,6 +127,7 @@ impl Env {
             allowed_origins,
             github_token,
             github_repo,
+            trust_container_network,
         })
     }
 
@@ -129,8 +142,9 @@ impl Env {
     /// front appended the last entry of X-Forwarded-For". If the process also
     /// listens on a public interface, anyone reaching that port directly
     /// writes the whole header themselves and picks their own bucket — the
-    /// rate limits stop meaning anything. Bind to loopback, or make sure a
-    /// firewall does the same job.
+    /// rate limits stop meaning anything. Bind to loopback, make sure a
+    /// firewall does the same job, or set `trust_container_network` when
+    /// something else already guarantees that (a ClusterIP Service).
     pub fn warn_about_exposure(&self) {
         let loopback = self
             .server_host
@@ -138,7 +152,7 @@ impl Env {
             .map(|ip| ip.is_loopback())
             .unwrap_or(false);
 
-        if self.trusted_proxy_hops > 0 && !loopback {
+        if self.trusted_proxy_hops > 0 && !loopback && !self.trust_container_network {
             tracing::error!(
                 host = %self.server_host,
                 hops = self.trusted_proxy_hops,

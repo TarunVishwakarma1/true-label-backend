@@ -57,6 +57,8 @@ pub struct ListCrashReportsQuery {
     pub status: Option<String>,
     pub platform: Option<String>,
     pub severity: Option<String>,
+    /// Matched against title and description, case-insensitively.
+    pub q: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: i64,
     #[serde(default)]

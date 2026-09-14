@@ -40,6 +40,17 @@ pub async fn list(
     Ok(Json(ApiResponse::success(page, false)))
 }
 
+/// Staff filing a report by hand — any signed-in account, the same as
+/// triaging. Not a privileged action the way publishing to GitHub is.
+pub async fn create_manual(
+    State(state): State<AppState>,
+    user: AdminUser,
+    Json(body): Json<SubmitCrashReportRequest>,
+) -> Result<Json<ApiResponse<CrashReport>>> {
+    let report = state.crash_report_service.create_manual(user.id, &body).await?;
+    Ok(Json(ApiResponse::success(report, false)))
+}
+
 pub async fn get(
     State(state): State<AppState>,
     _user: AdminUser,

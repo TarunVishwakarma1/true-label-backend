@@ -20,6 +20,7 @@ pub fn admin_auth_router() -> Router<AppState> {
 pub fn admin_crash_reports_router() -> Router<AppState> {
     Router::new()
         .route("/", get(crate::handlers::crash_reports::list))
+        .route("/", post(crate::handlers::crash_reports::create_manual))
         .route("/{id}", get(crate::handlers::crash_reports::get))
         .route("/{id}", patch(crate::handlers::crash_reports::update))
         .route("/{id}/github-issue", post(crate::handlers::crash_reports::publish_to_github))

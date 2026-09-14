@@ -33,19 +33,7 @@ impl CrashReportService {
     /// registering, so filing one can never depend on a token.
     #[tracing::instrument(skip_all)]
     pub async fn submit(&self, req: &SubmitCrashReportRequest) -> Result<CrashReport> {
-        let platform = one_of("platform", &req.platform, PLATFORMS)?;
-        let title = bounded("title", &req.title, 1, MAX_TITLE_LEN)?;
-        let description = optional_bounded("description", req.description.as_deref(), MAX_DESCRIPTION_LEN)?;
-        let stack_trace = optional_bounded("stack_trace", req.stack_trace.as_deref(), MAX_STACK_TRACE_LEN)?;
-        let app_version = optional_bounded("app_version", req.app_version.as_deref(), MAX_SHORT_FIELD_LEN)?;
-        let os_version = optional_bounded("os_version", req.os_version.as_deref(), MAX_SHORT_FIELD_LEN)?;
-        let device_model = optional_bounded("device_model", req.device_model.as_deref(), MAX_SHORT_FIELD_LEN)?;
-        let severity = match &req.severity {
-            Some(s) => one_of("severity", s, SEVERITIES)?,
-            None => "medium".to_string(),
-        };
-        let device_id = optional_bounded("device_id", req.device_id.as_deref(), 128)?;
-        let metadata = req.metadata.clone().unwrap_or_else(|| serde_json::json!({}));
+        let v = validate_submission(req)?;
 
         let report = sqlx::query_as::<_, CrashReport>(
             "INSERT INTO crash_reports
@@ -54,21 +42,54 @@ impl CrashReportService {
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'app', $9, $10)
              RETURNING *",
         )
-        .bind(&platform)
-        .bind(&title)
-        .bind(description.as_deref())
-        .bind(stack_trace.as_deref())
-        .bind(app_version.as_deref())
-        .bind(os_version.as_deref())
-        .bind(device_model.as_deref())
-        .bind(&severity)
-        .bind(device_id.as_deref())
-        .bind(&metadata)
+        .bind(&v.platform)
+        .bind(&v.title)
+        .bind(v.description.as_deref())
+        .bind(v.stack_trace.as_deref())
+        .bind(v.app_version.as_deref())
+        .bind(v.os_version.as_deref())
+        .bind(v.device_model.as_deref())
+        .bind(&v.severity)
+        .bind(v.device_id.as_deref())
+        .bind(&v.metadata)
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         tracing::info!(platform = %report.platform, severity = %report.severity, "crash report filed");
+        Ok(report)
+    }
+
+    /// Staff filing a report by hand — from a TestFlight crash log, a user
+    /// email, whatever has no automated path yet. `reported_by` is who to
+    /// ask; `device_id` from the client is dropped, since a human typing
+    /// this in isn't the device that crashed.
+    #[tracing::instrument(skip_all)]
+    pub async fn create_manual(&self, admin_id: Uuid, req: &SubmitCrashReportRequest) -> Result<CrashReport> {
+        let v = validate_submission(req)?;
+
+        let report = sqlx::query_as::<_, CrashReport>(
+            "INSERT INTO crash_reports
+               (platform, title, description, stack_trace, app_version, os_version,
+                device_model, severity, source, reported_by, metadata)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'manual', $9, $10)
+             RETURNING *",
+        )
+        .bind(&v.platform)
+        .bind(&v.title)
+        .bind(v.description.as_deref())
+        .bind(v.stack_trace.as_deref())
+        .bind(v.app_version.as_deref())
+        .bind(v.os_version.as_deref())
+        .bind(v.device_model.as_deref())
+        .bind(&v.severity)
+        .bind(admin_id)
+        .bind(&v.metadata)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        tracing::info!(platform = %report.platform, "crash report filed manually");
         Ok(report)
     }
 
@@ -79,18 +100,21 @@ impl CrashReportService {
         let status = query.status.as_deref().map(|s| one_of("status", s, STATUSES)).transpose()?;
         let platform = query.platform.as_deref().map(|p| one_of("platform", p, PLATFORMS)).transpose()?;
         let severity = query.severity.as_deref().map(|s| one_of("severity", s, SEVERITIES)).transpose()?;
+        let q = query.q.as_deref().map(str::trim).filter(|q| !q.is_empty());
 
         let items = sqlx::query_as::<_, CrashReport>(
             "SELECT * FROM crash_reports
              WHERE ($1::text IS NULL OR status = $1)
                AND ($2::text IS NULL OR platform = $2)
                AND ($3::text IS NULL OR severity = $3)
+               AND ($4::text IS NULL OR title ILIKE '%' || $4 || '%' OR description ILIKE '%' || $4 || '%')
              ORDER BY created_at DESC
-             LIMIT $4 OFFSET $5",
+             LIMIT $5 OFFSET $6",
         )
         .bind(&status)
         .bind(&platform)
         .bind(&severity)
+        .bind(q)
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.db)
@@ -101,11 +125,13 @@ impl CrashReportService {
             "SELECT COUNT(*) FROM crash_reports
              WHERE ($1::text IS NULL OR status = $1)
                AND ($2::text IS NULL OR platform = $2)
-               AND ($3::text IS NULL OR severity = $3)",
+               AND ($3::text IS NULL OR severity = $3)
+               AND ($4::text IS NULL OR title ILIKE '%' || $4 || '%' OR description ILIKE '%' || $4 || '%')",
         )
         .bind(&status)
         .bind(&platform)
         .bind(&severity)
+        .bind(q)
         .fetch_one(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -220,6 +246,40 @@ fn issue_body(report: &CrashReport) -> String {
     }
     body.push_str(&format!("\n_Filed from the TrueLabel dashboard — crash report `{}`._", report.id));
     body
+}
+
+/// Every field `submit` and `create_manual` share — only where the row ends
+/// up (source, device_id vs. reported_by) differs between them.
+struct ValidatedReport {
+    platform: String,
+    title: String,
+    description: Option<String>,
+    stack_trace: Option<String>,
+    app_version: Option<String>,
+    os_version: Option<String>,
+    device_model: Option<String>,
+    severity: String,
+    device_id: Option<String>,
+    metadata: serde_json::Value,
+}
+
+fn validate_submission(req: &SubmitCrashReportRequest) -> Result<ValidatedReport> {
+    let severity = match &req.severity {
+        Some(s) => one_of("severity", s, SEVERITIES)?,
+        None => "medium".to_string(),
+    };
+    Ok(ValidatedReport {
+        platform: one_of("platform", &req.platform, PLATFORMS)?,
+        title: bounded("title", &req.title, 1, MAX_TITLE_LEN)?,
+        description: optional_bounded("description", req.description.as_deref(), MAX_DESCRIPTION_LEN)?,
+        stack_trace: optional_bounded("stack_trace", req.stack_trace.as_deref(), MAX_STACK_TRACE_LEN)?,
+        app_version: optional_bounded("app_version", req.app_version.as_deref(), MAX_SHORT_FIELD_LEN)?,
+        os_version: optional_bounded("os_version", req.os_version.as_deref(), MAX_SHORT_FIELD_LEN)?,
+        device_model: optional_bounded("device_model", req.device_model.as_deref(), MAX_SHORT_FIELD_LEN)?,
+        severity,
+        device_id: optional_bounded("device_id", req.device_id.as_deref(), 128)?,
+        metadata: req.metadata.clone().unwrap_or_else(|| serde_json::json!({})),
+    })
 }
 
 fn one_of(field: &str, value: &str, allowed: &[&str]) -> Result<String> {

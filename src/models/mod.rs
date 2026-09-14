@@ -10,7 +10,7 @@ pub mod webhook;
 
 pub use admin::{
     AdminProfile, AdminSession, ChangePasswordRequest, DashboardUser, LoginRequest,
-    RegisterRequest, ResetPasswordRequest, UpdateRoleRequest,
+    RegisterRequest, ResetPasswordRequest, UpdatePermissionsRequest, UpdateRoleRequest,
 };
 pub use audit::{AuditLogEntry, AuditLogPage, ListAuditLogQuery};
 pub use crash_report::{
@@ -19,8 +19,10 @@ pub use crash_report::{
 };
 pub use ocr::{OcrResponse, OcrSubmission, SubmitLabelRequest};
 pub use product::{
-    AlternativesQuery, CardRow, NeedsVerificationQuery, Product, ProductCard, ProductResponse,
+    AdminProductPage, AdminUpdateProductRequest, AlternativesQuery, CardRow,
+    ListAdminProductsQuery, NeedsVerificationQuery, Product, ProductCard, ProductResponse,
     QueryProductsQuery, SearchProductQuery, TrendingQuery, VerificationCandidate,
+    VerifyProductAdminRequest,
 };
 pub use response::{ApiResponse, HealthResponse, ReadinessResponse, ServiceStatus};
 pub use user::{

@@ -14,6 +14,7 @@ pub struct DashboardUser {
     pub occupation: Option<String>,
     pub password_hash: String,
     pub role: String,
+    pub can_edit_products: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -25,6 +26,7 @@ pub struct AdminProfile {
     pub email: String,
     pub occupation: Option<String>,
     pub role: String,
+    pub can_edit_products: bool,
     pub created_at: DateTime<Utc>,
 }
 
@@ -36,6 +38,7 @@ impl From<DashboardUser> for AdminProfile {
             email: u.email,
             occupation: u.occupation,
             role: u.role,
+            can_edit_products: u.can_edit_products,
             created_at: u.created_at,
         }
     }
@@ -90,4 +93,11 @@ pub struct ChangePasswordRequest {
 #[derive(Debug, Deserialize)]
 pub struct ResetPasswordRequest {
     pub new_password: String,
+}
+
+/// Admin-only: grants or revokes a `member`'s product-edit rights. Never
+/// touches `role` itself — an admin already has this implicitly.
+#[derive(Debug, Deserialize)]
+pub struct UpdatePermissionsRequest {
+    pub can_edit_products: bool,
 }

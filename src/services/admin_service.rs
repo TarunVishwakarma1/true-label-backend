@@ -342,6 +342,40 @@ impl AdminService {
         .await;
         Ok(())
     }
+
+    /// Grants or revokes a `member`'s product-edit rights. Never touches
+    /// `role` — an admin's own edit rights come from `role` directly and
+    /// don't depend on this flag at all.
+    #[tracing::instrument(skip_all)]
+    pub async fn set_can_edit_products(
+        &self,
+        actor: &AdminUser,
+        target_id: Uuid,
+        can_edit_products: bool,
+    ) -> Result<AdminProfile> {
+        let user = sqlx::query_as::<_, DashboardUser>(
+            "UPDATE dashboard_users SET can_edit_products = $2, updated_at = NOW() WHERE id = $1 RETURNING *",
+        )
+        .bind(target_id)
+        .bind(can_edit_products)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or(AppError::ProductNotFound)?;
+
+        tracing::info!(target = %target_id, can_edit_products, "product edit permission updated");
+        audit::record(
+            &self.db,
+            Some(actor.id),
+            &actor.name,
+            "team.product_permission_changed",
+            "dashboard_user",
+            target_id,
+            serde_json::json!({ "can_edit_products": can_edit_products }),
+        )
+        .await;
+        Ok(AdminProfile::from(user))
+    }
 }
 
 fn one_of(field: &str, value: &str, allowed: &[&str]) -> Result<String> {

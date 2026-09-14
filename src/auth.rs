@@ -82,6 +82,9 @@ pub struct AdminUser {
     pub id: uuid::Uuid,
     pub name: String,
     pub role: String,
+    /// Additionally grantable to a `member` — see `require_product_edit`.
+    /// Meaningless for an `admin`, who can already edit regardless.
+    pub can_edit_products: bool,
 }
 
 impl AdminUser {
@@ -94,6 +97,19 @@ impl AdminUser {
             Err(AppError::Forbidden("admin role required".to_string()))
         }
     }
+
+    /// Product editing is opened up past `role` on purpose — "selected
+    /// users," not "admins only." Does NOT cover `/verify`, which stays
+    /// `require_admin`-gated: granting someone edit rights on a product's
+    /// data isn't the same as trusting their judgment on whether it's
+    /// correct enough to mark verified.
+    pub fn require_product_edit(&self) -> Result<(), AppError> {
+        if self.role == "admin" || self.can_edit_products {
+            Ok(())
+        } else {
+            Err(AppError::Forbidden("product edit permission required".to_string()))
+        }
+    }
 }
 
 impl FromRequestParts<AppState> for AdminUser {
@@ -103,8 +119,8 @@ impl FromRequestParts<AppState> for AdminUser {
         let token = bearer(parts).ok_or(AppError::Unauthorized)?;
         let not_before = Utc::now() - Duration::days(ADMIN_SESSION_TTL_DAYS);
 
-        let row: Option<(Uuid, String, String)> = sqlx::query_as(
-            "SELECT id, name, role FROM dashboard_users
+        let row: Option<(Uuid, String, String, bool)> = sqlx::query_as(
+            "SELECT id, name, role, can_edit_products FROM dashboard_users
              WHERE token_hash = $1 AND token_issued_at > $2",
         )
         .bind(hash_token(&token))
@@ -114,7 +130,7 @@ impl FromRequestParts<AppState> for AdminUser {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         match row {
-            Some((id, name, role)) => Ok(AdminUser { id, name, role }),
+            Some((id, name, role, can_edit_products)) => Ok(AdminUser { id, name, role, can_edit_products }),
             None => {
                 tracing::warn!("rejected a request carrying an unknown or expired dashboard session token");
                 Err(AppError::Unauthorized)

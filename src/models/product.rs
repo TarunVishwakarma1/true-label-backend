@@ -315,3 +315,96 @@ pub struct SearchProductQuery {
 fn default_country() -> String {
     "IN".to_string()
 }
+
+fn default_admin_limit() -> i64 {
+    50
+}
+
+/// The dashboard's product browser — unlike the public `/query` endpoint,
+/// this returns full `Product` rows (editing needs full detail, not just
+/// enough for a card) and isn't scoped to a search term.
+#[derive(Debug, Deserialize)]
+pub struct ListAdminProductsQuery {
+    /// Matched against product_name, brand, and barcode, case-insensitively.
+    pub q: Option<String>,
+    pub country: Option<String>,
+    pub verified: Option<bool>,
+    pub category: Option<String>,
+    #[serde(default = "default_admin_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+}
+
+/// `Admin`-prefixed, unlike `CrashReportPage`, because a public paginated
+/// product-listing endpoint is plausible here in a way a public
+/// crash-report list never would be — worth the extra clarity now.
+#[derive(Debug, Serialize)]
+pub struct AdminProductPage {
+    pub items: Vec<Product>,
+    pub total: i64,
+}
+
+/// A curated subset of `Product`'s ~35 columns — the fields an admin would
+/// plausibly hand-correct, not a mirror of the whole table. Notably absent:
+/// `barcode` (identity, not a correction — changing it is conceptually
+/// delete+recreate), `source`; every OFF-sync-managed or derived field
+/// (`off_synced_at`, `off_last_modified`, `completeness`, `nutriscore_score`,
+/// `ecoscore_grade`, `verification_count`, `confidence_score`,
+/// `lookup_count`, `nutrient_levels`, `serving_size`, `serving_quantity`);
+/// `traces_tags`/`labels_tags`/`categories_tags` (cut for v1 scope, the same
+/// call as skipping a structured nutrition editor — not because they're
+/// derived, they're primary data same as `nutrition_facts`); and `verified`
+/// itself, which is its own admin-only action (`POST .../verify`), not part
+/// of the general edit.
+// Serialize + skip_serializing_if on every field, not just Deserialize —
+// so `serde_json::to_value(&req)` is itself the "which fields actually
+// changed" audit-log payload, with no separate diff-building code.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct AdminUpdateProductRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brand: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingredients: Option<String>,
+    /// Written to `allergens_tags`, not the legacy `allergens` text column —
+    /// `ProductResponse::from` prefers `allergens_tags` whenever it's
+    /// present, so editing the text column would silently have no effect on
+    /// what the public API actually returns for most (OFF-sourced) products.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allergens: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nutrition_facts: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additives: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nova_group: Option<i16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nutriscore_grade: Option<String>,
+    // ponytail: these three are Option<bool> on the wire — can assert
+    // true/false but not reset a tri-state field back to unknown/null (that
+    // needs nested-Option wire plumbing). Add if that's ever actually
+    // needed; nobody's asked for it yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_vegan: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_vegetarian: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_palm_oil_free: Option<bool>,
+}
+
+/// `verified` is deliberately its own request type, not folded into
+/// `AdminUpdateProductRequest` — the route it arrives on
+/// (`POST .../verify`) is `require_admin`-gated, stricter than the general
+/// `PATCH`, which only needs `require_product_edit`.
+#[derive(Debug, Deserialize)]
+pub struct VerifyProductAdminRequest {
+    pub verified: bool,
+}

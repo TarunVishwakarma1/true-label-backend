@@ -27,13 +27,15 @@ pub fn admin_crash_reports_router() -> Router<AppState> {
         .route("/{id}/github-issue", post(crate::handlers::crash_reports::publish_to_github))
 }
 
-/// Who's on the team. Changing a role, resetting a password, and removing
-/// a member are all admin-gated in the handler.
+/// Who's on the team. Changing a role, resetting a password, granting
+/// product-edit rights, and removing a member are all admin-gated in the
+/// handler.
 pub fn admin_team_router() -> Router<AppState> {
     Router::new()
         .route("/", get(crate::handlers::admin_auth::list_team))
         .route("/{id}/role", patch(crate::handlers::admin_auth::update_role))
         .route("/{id}/password", patch(crate::handlers::admin_auth::reset_password))
+        .route("/{id}/permissions", patch(crate::handlers::admin_auth::update_permissions))
         .route("/{id}", delete(crate::handlers::admin_auth::remove_member))
 }
 
@@ -41,4 +43,16 @@ pub fn admin_team_router() -> Router<AppState> {
 /// signed-in staff," since this surfaces password resets and role changes.
 pub fn admin_activity_router() -> Router<AppState> {
     Router::new().route("/", get(crate::handlers::admin_auth::list_activity))
+}
+
+/// Browsing is for any signed-in staff account, same posture as crash
+/// reports; editing needs `require_product_edit()` (role admin, or the
+/// `can_edit_products` flag), verifying stays `require_admin()` — both
+/// checked in the handler, not here.
+pub fn admin_products_router() -> Router<AppState> {
+    Router::new()
+        .route("/", get(crate::handlers::admin_products::list))
+        .route("/{id}", get(crate::handlers::admin_products::get))
+        .route("/{id}", patch(crate::handlers::admin_products::update))
+        .route("/{id}/verify", post(crate::handlers::admin_products::verify))
 }

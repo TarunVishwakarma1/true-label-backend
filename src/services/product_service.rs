@@ -1,6 +1,11 @@
 use crate::{
+    audit,
+    auth::AdminUser,
     error::{AppError, Result},
-    models::{CardRow, Product, ProductCard, ProductResponse, SearchProductQuery, VerificationCandidate},
+    models::{
+        AdminProductPage, AdminUpdateProductRequest, CardRow, ListAdminProductsQuery, Product,
+        ProductCard, ProductResponse, SearchProductQuery, VerificationCandidate,
+    },
     services::cache_service::CacheService,
     services::openfoodfacts::OffClient,
 };
@@ -8,6 +13,7 @@ use chrono::Utc;
 use serde_json::json;
 use sqlx::PgPool;
 use std::sync::Arc;
+use uuid::Uuid;
 
 /// A product's facts don't change between two scans, and the one thing that
 /// does — a verification — deletes the key itself.
@@ -561,6 +567,170 @@ impl ProductService {
                 }
             })
             .collect())
+    }
+
+    /// Nothing today fetches a product by its own id — every public path
+    /// goes through barcode+country. Admin editing needs id-addressability
+    /// (a list row, then its own detail/edit page).
+    #[tracing::instrument(skip(self))]
+    pub async fn get_by_id(&self, id: Uuid) -> Result<Product> {
+        sqlx::query_as::<_, Product>("SELECT * FROM products WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .ok_or(AppError::ProductNotFound)
+    }
+
+    /// Any signed-in staff account can browse — read-only isn't sensitive,
+    /// same posture as crash reports. Returns full `Product` rows, not the
+    /// lighter `ProductCard` the public `/query` endpoint returns, since
+    /// editing needs full detail.
+    #[tracing::instrument(skip(self, query))]
+    pub async fn list_admin(&self, query: &ListAdminProductsQuery) -> Result<AdminProductPage> {
+        let limit = query.limit.clamp(1, 200);
+        let offset = query.offset.max(0);
+        let q = query.q.as_deref().map(str::trim).filter(|q| !q.is_empty());
+        let country = query.country.as_deref();
+        let category = query.category.as_deref();
+
+        let items = sqlx::query_as::<_, Product>(
+            "SELECT * FROM products
+             WHERE ($1::text IS NULL OR product_name ILIKE '%' || $1 || '%' OR brand ILIKE '%' || $1 || '%' OR barcode ILIKE '%' || $1 || '%')
+               AND ($2::text IS NULL OR country = $2)
+               AND ($3::boolean IS NULL OR verified = $3)
+               AND ($4::text IS NULL OR category = $4)
+             ORDER BY created_at DESC
+             LIMIT $5 OFFSET $6",
+        )
+        .bind(q)
+        .bind(country)
+        .bind(query.verified)
+        .bind(category)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM products
+             WHERE ($1::text IS NULL OR product_name ILIKE '%' || $1 || '%' OR brand ILIKE '%' || $1 || '%' OR barcode ILIKE '%' || $1 || '%')
+               AND ($2::text IS NULL OR country = $2)
+               AND ($3::boolean IS NULL OR verified = $3)
+               AND ($4::text IS NULL OR category = $4)",
+        )
+        .bind(q)
+        .bind(country)
+        .bind(query.verified)
+        .bind(category)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(AdminProductPage { items, total })
+    }
+
+    /// Gated by `require_product_edit()` in the handler (role admin, or the
+    /// `can_edit_products` flag) — deliberately NOT `verified`, which is its
+    /// own admin-only action (`set_verified` below). Must invalidate the
+    /// same two cache keys `verify_product` above already does, or a
+    /// correction wouldn't be visible to users for up to the cache's TTL.
+    #[tracing::instrument(skip(self, req))]
+    pub async fn update_admin(&self, actor: &AdminUser, id: Uuid, req: &AdminUpdateProductRequest) -> Result<Product> {
+        let allergens_tags = req.allergens.as_ref().map(|v| json!(v));
+
+        let product = sqlx::query_as::<_, Product>(
+            "UPDATE products SET
+               product_name = COALESCE($2, product_name),
+               brand = COALESCE($3, brand),
+               category = COALESCE($4, category),
+               ingredients = COALESCE($5, ingredients),
+               allergens_tags = COALESCE($6, allergens_tags),
+               image_url = COALESCE($7, image_url),
+               quantity = COALESCE($8, quantity),
+               nutrition_facts = COALESCE($9, nutrition_facts),
+               additives = COALESCE($10, additives),
+               nova_group = COALESCE($11, nova_group),
+               nutriscore_grade = COALESCE($12, nutriscore_grade),
+               is_vegan = COALESCE($13, is_vegan),
+               is_vegetarian = COALESCE($14, is_vegetarian),
+               is_palm_oil_free = COALESCE($15, is_palm_oil_free),
+               updated_at = NOW()
+             WHERE id = $1
+             RETURNING *",
+        )
+        .bind(id)
+        .bind(&req.product_name)
+        .bind(&req.brand)
+        .bind(&req.category)
+        .bind(&req.ingredients)
+        .bind(&allergens_tags)
+        .bind(&req.image_url)
+        .bind(&req.quantity)
+        .bind(&req.nutrition_facts)
+        .bind(&req.additives)
+        .bind(req.nova_group)
+        .bind(&req.nutriscore_grade)
+        .bind(req.is_vegan)
+        .bind(req.is_vegetarian)
+        .bind(req.is_palm_oil_free)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or(AppError::ProductNotFound)?;
+
+        let cache_key = CacheService::cache_key(&product.barcode, &product.country);
+        let _ = self.cache.delete(&cache_key).await;
+        let _ = self.cache.delete(&format!("{cache_key}:miss")).await;
+
+        tracing::info!(product_id = %product.id, "product updated by an admin");
+        audit::record(
+            &self.db,
+            Some(actor.id),
+            &actor.name,
+            "product.updated",
+            "product",
+            product.id,
+            serde_json::to_value(req).unwrap_or_default(),
+        )
+        .await;
+        Ok(product)
+    }
+
+    /// A separate, authoritative override sitting alongside the existing
+    /// crowd-verification path above (`verify_product`, which auto-sets
+    /// `verified` at 3 crowd verifications) — not a rebuild of it.
+    /// Admin-only in the handler; unlike `update_admin`, granting
+    /// `can_edit_products` to a member does not extend to this.
+    #[tracing::instrument(skip(self))]
+    pub async fn set_verified(&self, actor: &AdminUser, id: Uuid, verified: bool) -> Result<Product> {
+        let product = sqlx::query_as::<_, Product>(
+            "UPDATE products SET verified = $2, updated_at = NOW() WHERE id = $1 RETURNING *",
+        )
+        .bind(id)
+        .bind(verified)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or(AppError::ProductNotFound)?;
+
+        let cache_key = CacheService::cache_key(&product.barcode, &product.country);
+        let _ = self.cache.delete(&cache_key).await;
+        let _ = self.cache.delete(&format!("{cache_key}:miss")).await;
+
+        tracing::info!(product_id = %product.id, verified, "product verification set by an admin");
+        audit::record(
+            &self.db,
+            Some(actor.id),
+            &actor.name,
+            "product.verified",
+            "product",
+            product.id,
+            json!({ "verified": verified }),
+        )
+        .await;
+        Ok(product)
     }
 }
 

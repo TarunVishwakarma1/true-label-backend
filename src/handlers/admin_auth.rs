@@ -4,7 +4,8 @@ use crate::{
     error::Result,
     models::{
         AdminProfile, AdminSession, ApiResponse, AuditLogPage, ChangePasswordRequest,
-        ListAuditLogQuery, LoginRequest, RegisterRequest, ResetPasswordRequest, UpdateRoleRequest,
+        ListAuditLogQuery, LoginRequest, RegisterRequest, ResetPasswordRequest,
+        UpdatePermissionsRequest, UpdateRoleRequest,
     },
     state::AppState,
 };
@@ -120,6 +121,19 @@ pub async fn remove_member(
     user.require_admin()?;
     state.admin_service.remove_member(&user, id).await?;
     Ok(Json(ApiResponse::success(serde_json::json!({ "removed": true }), false)))
+}
+
+/// Admin-only — grants or revokes a `member`'s product-edit rights. Never
+/// the `role` itself, which stays a separate action.
+pub async fn update_permissions(
+    State(state): State<AppState>,
+    user: AdminUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<UpdatePermissionsRequest>,
+) -> Result<Json<ApiResponse<AdminProfile>>> {
+    user.require_admin()?;
+    let profile = state.admin_service.set_can_edit_products(&user, id, body.can_edit_products).await?;
+    Ok(Json(ApiResponse::success(profile, false)))
 }
 
 /// Admin-only to view — tighter than crash-reports' "any signed-in staff,"

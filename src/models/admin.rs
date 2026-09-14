@@ -73,3 +73,21 @@ pub struct LoginRequest {
 pub struct UpdateRoleRequest {
     pub role: String,
 }
+
+/// Self-service: a signed-in account changing its own password. Requires
+/// the current one on purpose — the bearer token alone proves "a signed-in
+/// session," not "this person still knows the password," and a stolen
+/// unattended session shouldn't be enough to lock the real owner out.
+#[derive(Debug, Deserialize)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+/// Admin-only: resetting a *different* account's password (a locked-out
+/// teammate). No current-password check — the admin's own session is the
+/// authority here, the same posture as UpdateRoleRequest.
+#[derive(Debug, Deserialize)]
+pub struct ResetPasswordRequest {
+    pub new_password: String,
+}

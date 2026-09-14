@@ -1,7 +1,10 @@
 use crate::{
     auth::{AdminUser, ClientIp, MaybeAdminUser},
     error::Result,
-    models::{AdminProfile, AdminSession, ApiResponse, LoginRequest, RegisterRequest, UpdateRoleRequest},
+    models::{
+        AdminProfile, AdminSession, ApiResponse, ChangePasswordRequest, LoginRequest,
+        RegisterRequest, ResetPasswordRequest, UpdateRoleRequest,
+    },
     state::AppState,
 };
 use axum::{
@@ -16,6 +19,9 @@ use uuid::Uuid;
 /// existing admin's token for every account after the first.
 const REGISTRATIONS_PER_HOUR: u32 = 10;
 const LOGIN_ATTEMPTS_PER_HOUR: u32 = 20;
+/// Same ceiling as login attempts — change_password's current-password
+/// check is exactly as guessable as login's, same limit makes sense.
+const PASSWORD_ATTEMPTS_PER_HOUR: u32 = 20;
 const HOUR: u64 = 3600;
 
 pub async fn register(
@@ -75,4 +81,29 @@ pub async fn update_role(
     user.require_admin()?;
     let profile = state.admin_service.update_role(id, &body.role).await?;
     Ok(Json(ApiResponse::success(profile, false)))
+}
+
+pub async fn change_password(
+    State(state): State<AppState>,
+    user: AdminUser,
+    Json(body): Json<ChangePasswordRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>> {
+    state.limit("admin_password", &user.id.to_string(), PASSWORD_ATTEMPTS_PER_HOUR, HOUR).await?;
+    state.admin_service.change_password(user.id, &body.current_password, &body.new_password).await?;
+    Ok(Json(ApiResponse::success(serde_json::json!({ "changed": true }), false)))
+}
+
+/// For a locked-out teammate — an admin resets it, the teammate logs in
+/// with the new password and should change it via `change_password`
+/// afterward (this endpoint doesn't force that, it just isn't a
+/// self-service flow to begin with).
+pub async fn reset_password(
+    State(state): State<AppState>,
+    user: AdminUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ResetPasswordRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>> {
+    user.require_admin()?;
+    state.admin_service.reset_password(id, &body.new_password).await?;
+    Ok(Json(ApiResponse::success(serde_json::json!({ "reset": true }), false)))
 }

@@ -206,6 +206,60 @@ impl AdminService {
         tracing::info!(role = %user.role, "dashboard role updated");
         Ok(AdminProfile::from(user))
     }
+
+    /// Self-service. Requires the current password — the bearer token alone
+    /// proves "a live session," not "this is really the account owner," and
+    /// an unattended signed-in browser shouldn't be enough to lock the real
+    /// owner out of their own account.
+    #[tracing::instrument(skip_all)]
+    pub async fn change_password(&self, user_id: Uuid, current_password: &str, new_password: &str) -> Result<()> {
+        let user = sqlx::query_as::<_, DashboardUser>("SELECT * FROM dashboard_users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .ok_or(AppError::Unauthorized)?;
+
+        if !verify_password(current_password, &user.password_hash)? {
+            tracing::warn!("rejected a password change with the wrong current password");
+            return Err(AppError::Unauthorized);
+        }
+        validate_password(new_password)?;
+
+        sqlx::query("UPDATE dashboard_users SET password_hash = $2, updated_at = NOW() WHERE id = $1")
+            .bind(user_id)
+            .bind(hash_password(new_password)?)
+            .execute(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        tracing::info!("dashboard password changed");
+        Ok(())
+    }
+
+    /// Admin-only, for a locked-out teammate — no current-password check,
+    /// the caller's own admin session is the authority (same posture as
+    /// `update_role`). Doesn't cover the sole-admin-locked-themselves-out
+    /// case by construction: there's no other admin left to call this.
+    /// That's a documented manual/DB recovery, not an API — see
+    /// docs/deployment.mdx.
+    #[tracing::instrument(skip_all)]
+    pub async fn reset_password(&self, target_id: Uuid, new_password: &str) -> Result<()> {
+        validate_password(new_password)?;
+
+        let result = sqlx::query("UPDATE dashboard_users SET password_hash = $2, updated_at = NOW() WHERE id = $1")
+            .bind(target_id)
+            .bind(hash_password(new_password)?)
+            .execute(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        if result.rows_affected() == 0 {
+            return Err(AppError::ProductNotFound);
+        }
+        tracing::info!(target = %target_id, "dashboard password reset by an admin");
+        Ok(())
+    }
 }
 
 fn one_of(field: &str, value: &str, allowed: &[&str]) -> Result<String> {
@@ -216,7 +270,12 @@ fn one_of(field: &str, value: &str, allowed: &[&str]) -> Result<String> {
     }
 }
 
-fn hash_password(password: &str) -> Result<String> {
+/// `pub`, not just crate-private: `main.rs`'s `--hash-password` mode calls
+/// this directly, so the manual sole-admin-lockout recovery in
+/// docs/deployment.mdx hashes with the exact same code path a real
+/// register/reset would — never a hand-rolled or differently-parameterized
+/// hash that might not verify.
+pub fn hash_password(password: &str) -> Result<String> {
     let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
         .hash_password(password.as_bytes(), &salt)

@@ -12,6 +12,7 @@ pub fn admin_auth_router() -> Router<AppState> {
         .route("/login", post(crate::handlers::admin_auth::login))
         .route("/me", get(crate::handlers::admin_auth::me))
         .route("/logout", post(crate::handlers::admin_auth::logout))
+        .route("/password", patch(crate::handlers::admin_auth::change_password))
 }
 
 /// Reading and triaging reports is for any signed-in staff account;
@@ -31,4 +32,5 @@ pub fn admin_team_router() -> Router<AppState> {
     Router::new()
         .route("/", get(crate::handlers::admin_auth::list_team))
         .route("/{id}/role", patch(crate::handlers::admin_auth::update_role))
+        .route("/{id}/password", patch(crate::handlers::admin_auth::reset_password))
 }

@@ -3,6 +3,7 @@ pub mod crash_reports;
 pub mod ocr;
 pub mod products;
 pub mod me;
+pub mod webhooks;
 
 use crate::state::AppState;
 use axum::routing::Router;
@@ -17,4 +18,6 @@ pub fn v1_router() -> Router<AppState> {
         .nest("/admin/auth", admin::admin_auth_router())
         .nest("/admin/crash-reports", admin::admin_crash_reports_router())
         .nest("/admin/team", admin::admin_team_router())
+        .nest("/admin/activity", admin::admin_activity_router())
+        .nest("/webhooks", webhooks::webhooks_router())
 }

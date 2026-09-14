@@ -1,15 +1,18 @@
 pub mod admin;
+pub mod audit;
 pub mod crash_report;
 pub mod ocr;
 pub mod product;
 pub mod response;
 pub mod user;
 pub mod verification;
+pub mod webhook;
 
 pub use admin::{
     AdminProfile, AdminSession, ChangePasswordRequest, DashboardUser, LoginRequest,
     RegisterRequest, ResetPasswordRequest, UpdateRoleRequest,
 };
+pub use audit::{AuditLogEntry, AuditLogPage, ListAuditLogQuery};
 pub use crash_report::{
     CrashReport, CrashReportPage, GitHubIssueRef, ListCrashReportsQuery, SubmitCrashReportRequest,
     UpdateCrashReportRequest,
@@ -25,3 +28,4 @@ pub use user::{
     SubscriptionResponse, UpdateProfileRequest, User,
 };
 pub use verification::{Verification, VerifyProductRequest};
+pub use webhook::{GitHubIssuePayload, GitHubIssueWebhookPayload};

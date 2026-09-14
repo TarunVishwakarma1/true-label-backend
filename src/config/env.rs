@@ -31,6 +31,12 @@ pub struct Env {
     /// — used only to link a filed GitHub issue back to the crash report it
     /// came from. Absent just means that one link is omitted, not an error.
     pub dashboard_url: Option<String>,
+    /// The shared secret configured on the GitHub webhook (Settings →
+    /// Webhooks) that lets `POST /api/v1/webhooks/github` verify a delivery
+    /// actually came from GitHub, via `X-Hub-Signature-256`. Absent means
+    /// that one endpoint refuses every request — there's no way to trust an
+    /// unsigned delivery, so "unset" has to mean "closed," not "open."
+    pub github_webhook_secret: Option<String>,
     /// `warn_about_exposure`'s loopback check assumes this process's own
     /// bind address is what stands between it and the public internet —
     /// true for a droplet (backend + nginx, same host), false inside a
@@ -119,6 +125,9 @@ impl Env {
             .map(|v| v.trim().trim_end_matches('/').to_string())
             .filter(|v| !v.is_empty());
 
+        let github_webhook_secret =
+            std::env::var("GITHUB_WEBHOOK_SECRET").ok().filter(|v| !v.is_empty());
+
         let trust_container_network = std::env::var("TRUST_CONTAINER_NETWORK")
             .ok()
             .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
@@ -138,6 +147,7 @@ impl Env {
             github_token,
             github_repo,
             dashboard_url,
+            github_webhook_secret,
             trust_container_network,
         })
     }

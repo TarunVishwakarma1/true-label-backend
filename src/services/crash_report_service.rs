@@ -1,4 +1,6 @@
 use crate::{
+    audit,
+    auth::AdminUser,
     error::{AppError, Result},
     models::{CrashReport, CrashReportPage, ListCrashReportsQuery, SubmitCrashReportRequest, UpdateCrashReportRequest},
     services::GitHubService,
@@ -154,47 +156,86 @@ impl CrashReportService {
     /// judgment calls, not a privileged action. Publishing to GitHub is the
     /// one gated separately, in the handler.
     #[tracing::instrument(skip_all)]
-    pub async fn update(&self, id: Uuid, req: &UpdateCrashReportRequest) -> Result<CrashReport> {
+    pub async fn update(&self, actor: &AdminUser, id: Uuid, req: &UpdateCrashReportRequest) -> Result<CrashReport> {
         let status = req.status.as_deref().map(|s| one_of("status", s, STATUSES)).transpose()?;
         let severity = req.severity.as_deref().map(|s| one_of("severity", s, SEVERITIES)).transpose()?;
 
-        // Every expression here reads the row as it stood before this
-        // statement, `status` included — so the CASE below is comparing
-        // against the *old* status even though `status` itself is also
-        // being written a few lines up. Newly done stamps `resolved_at`;
-        // moved to anything else clears it; a severity-only update (`$2`
-        // NULL) or marking an already-done report done again leaves it
-        // alone. `wont_fix` deliberately does not set it — that is a closed
-        // state, not a fixed one.
-        let report = sqlx::query_as::<_, CrashReport>(
-            "UPDATE crash_reports SET
-               status = COALESCE($2, status),
-               severity = COALESCE($3, severity),
-               resolved_at = CASE
-                 WHEN $2 = 'done' AND status <> 'done' THEN NOW()
-                 WHEN $2 IS NOT NULL AND $2 <> 'done' THEN NULL
-                 ELSE resolved_at
-               END,
-               updated_at = NOW()
-             WHERE id = $1
-             RETURNING *",
-        )
-        .bind(id)
-        .bind(&status)
-        .bind(&severity)
-        .fetch_optional(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .ok_or(AppError::ProductNotFound)?;
-
+        let report = write_status_update(&self.db, id, status.as_deref(), severity.as_deref()).await?;
         tracing::info!(status = %report.status, "crash report updated");
+
+        if status.is_some() || severity.is_some() {
+            audit::record(
+                &self.db,
+                Some(actor.id),
+                &actor.name,
+                "crash_report.status_changed",
+                "crash_report",
+                report.id,
+                serde_json::json!({ "status": report.status, "severity": report.severity }),
+            )
+            .await;
+        }
+
+        // Dashboard → GitHub. Never the other way from this path — the
+        // webhook handler calls `write_status_update` directly, never
+        // `update`, so there is no `self.github` in scope on that path and
+        // no way for this call to be what a webhook delivery triggers.
+        if let Some(new_status) = &status {
+            self.sync_status_to_github(&report, new_status).await;
+        }
+
         Ok(report)
+    }
+
+    /// GitHub → dashboard. A miss (the issue isn't one of ours — this repo's
+    /// webhook fires for every issue, not just crash reports) is a no-op,
+    /// not an error. Deliberately does not call back out to GitHub: this is
+    /// the one-way half of the sync, the other half lives in `update`.
+    #[tracing::instrument(skip_all)]
+    pub async fn sync_status_from_github(&self, issue_number: i32, status: &str) -> Result<()> {
+        let id: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM crash_reports WHERE github_issue_number = $1")
+                .bind(issue_number)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let Some(id) = id else { return Ok(()) };
+
+        write_status_update(&self.db, id, Some(status), None).await?;
+        tracing::info!(%id, issue = issue_number, status, "crash report status synced from a GitHub webhook");
+        audit::record(
+            &self.db,
+            None,
+            "GitHub",
+            "crash_report.status_changed",
+            "crash_report",
+            id,
+            serde_json::json!({ "status": status, "source": "github_webhook" }),
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Best-effort: a report with no linked issue, or a GitHub API hiccup,
+    /// never blocks the dashboard-side status change that triggered this —
+    /// the write already committed by the time this runs.
+    async fn sync_status_to_github(&self, report: &CrashReport, new_status: &str) {
+        let Some(number) = report.github_issue_number else { return };
+        let (state, reason) = match new_status {
+            "done" => ("closed", Some("completed")),
+            "wont_fix" => ("closed", Some("not_planned")),
+            _ => ("open", None),
+        };
+        if let Err(e) = self.github.update_issue_state(number, state, reason).await {
+            tracing::warn!(error = %e, issue = number, "failed to sync crash report status to GitHub");
+        }
     }
 
     /// One click, one issue: a report already carrying a `github_issue_url`
     /// refuses rather than opening a duplicate.
     #[tracing::instrument(skip_all)]
-    pub async fn publish_to_github(&self, id: Uuid) -> Result<CrashReport> {
+    pub async fn publish_to_github(&self, actor: &AdminUser, id: Uuid) -> Result<CrashReport> {
         let report = self.get(id).await?;
         if report.github_issue_url.is_some() {
             return Err(AppError::Conflict("already published to GitHub".to_string()));
@@ -229,8 +270,60 @@ impl CrashReportService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         tracing::info!(issue = issue.number, "crash report published to GitHub");
+        audit::record(
+            &self.db,
+            Some(actor.id),
+            &actor.name,
+            "crash_report.github_issue_published",
+            "crash_report",
+            report.id,
+            serde_json::json!({ "issue_number": issue.number, "issue_url": issue.url }),
+        )
+        .await;
         Ok(report)
     }
+}
+
+/// The actual status/severity write, shared by both sync directions.
+/// Deliberately a free function taking `db: &PgPool` rather than a method
+/// on `CrashReportService` — there is no `self` in scope here, so there is
+/// no `self.github` to call, which is what makes the webhook path
+/// structurally incapable of triggering an outbound GitHub call rather than
+/// merely convention not to.
+///
+/// Every expression here reads the row as it stood before this statement,
+/// `status` included — so the CASE below is comparing against the *old*
+/// status even though `status` itself is also being written a few lines up.
+/// Newly done stamps `resolved_at`; moved to anything else clears it; a
+/// severity-only update (`$2` NULL) or marking an already-done report done
+/// again leaves it alone. `wont_fix` deliberately does not set it — that is
+/// a closed state, not a fixed one.
+async fn write_status_update(
+    db: &PgPool,
+    id: Uuid,
+    status: Option<&str>,
+    severity: Option<&str>,
+) -> Result<CrashReport> {
+    sqlx::query_as::<_, CrashReport>(
+        "UPDATE crash_reports SET
+           status = COALESCE($2, status),
+           severity = COALESCE($3, severity),
+           resolved_at = CASE
+             WHEN $2 = 'done' AND status <> 'done' THEN NOW()
+             WHEN $2 IS NOT NULL AND $2 <> 'done' THEN NULL
+             ELSE resolved_at
+           END,
+           updated_at = NOW()
+         WHERE id = $1
+         RETURNING *",
+    )
+    .bind(id)
+    .bind(status)
+    .bind(severity)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?
+    .ok_or(AppError::ProductNotFound)
 }
 
 /// Reads like a person filed it, because as much of it as the data allows

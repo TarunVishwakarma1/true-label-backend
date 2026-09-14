@@ -18,6 +18,7 @@ fn test_config() -> Env {
         github_token: None,
         github_repo: None,
         dashboard_url: None,
+        github_webhook_secret: None,
         trust_container_network: false,
     }
 }

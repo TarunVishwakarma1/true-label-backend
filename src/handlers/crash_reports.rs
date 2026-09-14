@@ -62,11 +62,11 @@ pub async fn get(
 
 pub async fn update(
     State(state): State<AppState>,
-    _user: AdminUser,
+    user: AdminUser,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateCrashReportRequest>,
 ) -> Result<Json<ApiResponse<CrashReport>>> {
-    let report = state.crash_report_service.update(id, &body).await?;
+    let report = state.crash_report_service.update(&user, id, &body).await?;
     Ok(Json(ApiResponse::success(report, false)))
 }
 
@@ -79,7 +79,7 @@ pub async fn publish_to_github(
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<GitHubIssueRef>>> {
     user.require_admin()?;
-    let report = state.crash_report_service.publish_to_github(id).await?;
+    let report = state.crash_report_service.publish_to_github(&user, id).await?;
     let issue = GitHubIssueRef {
         number: report.github_issue_number.unwrap_or_default(),
         url: report.github_issue_url.clone().unwrap_or_default(),

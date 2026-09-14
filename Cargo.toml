@@ -28,6 +28,11 @@ dotenvy = "0.15"
 governor = "0.10.4"
 jsonwebtoken = "9.3"
 sha2 = "0.10"
+# GitHub signs webhook deliveries with HMAC-SHA256 (`X-Hub-Signature-256`) —
+# RustCrypto's sibling of the sha2 crate above, so this adds no new
+# transitive dependencies. Verifying that signature by hand from raw sha2
+# primitives is the kind of thing not worth hand-rolling.
+hmac = "0.12"
 rustls = { version = "0.23.44", features = ["ring"] }
 # Dashboard admin accounts carry a real password, worth phishing unlike a
 # device token, so it needs a slow, salted hash — not the sha2 digest used

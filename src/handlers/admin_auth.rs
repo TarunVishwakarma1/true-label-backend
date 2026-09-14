@@ -1,15 +1,16 @@
 use crate::{
+    audit,
     auth::{AdminUser, ClientIp, MaybeAdminUser},
     error::Result,
     models::{
-        AdminProfile, AdminSession, ApiResponse, ChangePasswordRequest, LoginRequest,
-        RegisterRequest, ResetPasswordRequest, UpdateRoleRequest,
+        AdminProfile, AdminSession, ApiResponse, AuditLogPage, ChangePasswordRequest,
+        ListAuditLogQuery, LoginRequest, RegisterRequest, ResetPasswordRequest, UpdateRoleRequest,
     },
     state::AppState,
 };
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
 };
 use uuid::Uuid;
 
@@ -79,7 +80,7 @@ pub async fn update_role(
     Json(body): Json<UpdateRoleRequest>,
 ) -> Result<Json<ApiResponse<AdminProfile>>> {
     user.require_admin()?;
-    let profile = state.admin_service.update_role(id, &body.role).await?;
+    let profile = state.admin_service.update_role(&user, id, &body.role).await?;
     Ok(Json(ApiResponse::success(profile, false)))
 }
 
@@ -104,6 +105,31 @@ pub async fn reset_password(
     Json(body): Json<ResetPasswordRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>> {
     user.require_admin()?;
-    state.admin_service.reset_password(id, &body.new_password).await?;
+    state.admin_service.reset_password(&user, id, &body.new_password).await?;
     Ok(Json(ApiResponse::success(serde_json::json!({ "reset": true }), false)))
+}
+
+/// Admin-only, same posture as `reset_password`/`update_role` — irreversible,
+/// so the guard rails (no self-removal, can't remove the last admin) live in
+/// the service, not here.
+pub async fn remove_member(
+    State(state): State<AppState>,
+    user: AdminUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ApiResponse<serde_json::Value>>> {
+    user.require_admin()?;
+    state.admin_service.remove_member(&user, id).await?;
+    Ok(Json(ApiResponse::success(serde_json::json!({ "removed": true }), false)))
+}
+
+/// Admin-only to view — tighter than crash-reports' "any signed-in staff,"
+/// since this surfaces password resets and role changes.
+pub async fn list_activity(
+    State(state): State<AppState>,
+    user: AdminUser,
+    Query(query): Query<ListAuditLogQuery>,
+) -> Result<Json<ApiResponse<AuditLogPage>>> {
+    user.require_admin()?;
+    let page = audit::list(&state.db, &query).await?;
+    Ok(Json(ApiResponse::success(page, false)))
 }

@@ -3,6 +3,7 @@
 //! the migration comment on `dashboard_users` for why.
 
 use crate::{
+    audit,
     auth::{self, AdminUser},
     error::{AppError, Result},
     models::{AdminProfile, AdminSession, DashboardUser, LoginRequest, RegisterRequest},
@@ -97,6 +98,20 @@ impl AdminService {
         })?;
 
         tracing::info!(role = %user.role, "dashboard account registered");
+        // Only a real invite, not the first-account bootstrap — nobody
+        // "invited" the very first admin, there was no one to do it.
+        if let Some(admin) = caller {
+            audit::record(
+                &self.db,
+                Some(admin.id),
+                &admin.name,
+                "team.member_invited",
+                "dashboard_user",
+                user.id,
+                serde_json::json!({ "email": user.email, "role": user.role }),
+            )
+            .await;
+        }
         Ok(AdminSession { token, profile: AdminProfile::from(user) })
     }
 
@@ -174,7 +189,7 @@ impl AdminService {
     /// Refuses to demote the last admin — otherwise the team can lock
     /// itself out with no way back in short of a direct database edit.
     #[tracing::instrument(skip_all)]
-    pub async fn update_role(&self, user_id: Uuid, role: &str) -> Result<AdminProfile> {
+    pub async fn update_role(&self, actor: &AdminUser, user_id: Uuid, role: &str) -> Result<AdminProfile> {
         let role = one_of("role", role, &["admin", "member"])?;
 
         let target = sqlx::query_as::<_, DashboardUser>("SELECT * FROM dashboard_users WHERE id = $1")
@@ -204,6 +219,16 @@ impl AdminService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         tracing::info!(role = %user.role, "dashboard role updated");
+        audit::record(
+            &self.db,
+            Some(actor.id),
+            &actor.name,
+            "team.role_changed",
+            "dashboard_user",
+            user.id,
+            serde_json::json!({ "from": target.role, "to": user.role }),
+        )
+        .await;
         Ok(AdminProfile::from(user))
     }
 
@@ -244,7 +269,7 @@ impl AdminService {
     /// That's a documented manual/DB recovery, not an API — see
     /// docs/deployment.mdx.
     #[tracing::instrument(skip_all)]
-    pub async fn reset_password(&self, target_id: Uuid, new_password: &str) -> Result<()> {
+    pub async fn reset_password(&self, actor: &AdminUser, target_id: Uuid, new_password: &str) -> Result<()> {
         validate_password(new_password)?;
 
         let result = sqlx::query("UPDATE dashboard_users SET password_hash = $2, updated_at = NOW() WHERE id = $1")
@@ -258,6 +283,63 @@ impl AdminService {
             return Err(AppError::ProductNotFound);
         }
         tracing::info!(target = %target_id, "dashboard password reset by an admin");
+        audit::record(
+            &self.db,
+            Some(actor.id),
+            &actor.name,
+            "team.password_reset",
+            "dashboard_user",
+            target_id,
+            serde_json::json!({}),
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Refuses self-removal (no way back into your own account once your
+    /// session eventually expires) and refuses removing the last admin —
+    /// the same guard `update_role` already uses for demotion, reused here
+    /// for the more permanent version of the same mistake.
+    #[tracing::instrument(skip_all)]
+    pub async fn remove_member(&self, actor: &AdminUser, target_id: Uuid) -> Result<()> {
+        if target_id == actor.id {
+            return Err(AppError::Conflict("can't remove your own account".to_string()));
+        }
+
+        let target = sqlx::query_as::<_, DashboardUser>("SELECT * FROM dashboard_users WHERE id = $1")
+            .bind(target_id)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .ok_or(AppError::ProductNotFound)?;
+
+        if target.role == "admin" {
+            let admins: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dashboard_users WHERE role = 'admin'")
+                .fetch_one(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            if admins <= 1 {
+                return Err(AppError::Conflict("can't remove the last admin".to_string()));
+            }
+        }
+
+        sqlx::query("DELETE FROM dashboard_users WHERE id = $1")
+            .bind(target_id)
+            .execute(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        tracing::info!(target = %target_id, "dashboard account removed");
+        audit::record(
+            &self.db,
+            Some(actor.id),
+            &actor.name,
+            "team.member_removed",
+            "dashboard_user",
+            target_id,
+            serde_json::json!({ "name": target.name, "email": target.email, "role": target.role }),
+        )
+        .await;
         Ok(())
     }
 }

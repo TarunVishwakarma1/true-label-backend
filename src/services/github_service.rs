@@ -35,6 +35,13 @@ struct CreateIssueResponse {
     html_url: String,
 }
 
+#[derive(Debug, Serialize)]
+struct UpdateIssueBody<'a> {
+    state: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_reason: Option<&'a str>,
+}
+
 impl GitHubService {
     pub fn new(token: Option<String>, repo: Option<String>) -> Self {
         Self {
@@ -48,8 +55,10 @@ impl GitHubService {
         }
     }
 
-    #[tracing::instrument(skip_all)]
-    pub async fn create_issue(&self, title: &str, body: &str, labels: &[&str]) -> Result<GitHubIssueRef> {
+    /// Both `create_issue` and `update_issue_state` need a token and a repo
+    /// before they can call anything — one place for that check so the two
+    /// don't drift on the error message.
+    fn credentials(&self) -> Result<(&str, &str)> {
         let token = self.token.as_deref().ok_or_else(|| {
             AppError::ExternalApi(
                 "GitHub publishing isn't configured (set GITHUB_TOKEN and GITHUB_REPO)".to_string(),
@@ -60,6 +69,12 @@ impl GitHubService {
                 "GitHub publishing isn't configured (set GITHUB_TOKEN and GITHUB_REPO)".to_string(),
             )
         })?;
+        Ok((token, repo))
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub async fn create_issue(&self, title: &str, body: &str, labels: &[&str]) -> Result<GitHubIssueRef> {
+        let (token, repo) = self.credentials()?;
 
         let response = self
             .client
@@ -85,5 +100,34 @@ impl GitHubService {
             .map_err(|e| AppError::ExternalApi(format!("unreadable GitHub response: {e}")))?;
 
         Ok(GitHubIssueRef { number: created.number, url: created.html_url })
+    }
+
+    /// Mirrors a dashboard status change onto the linked issue — `state` is
+    /// `"open"` or `"closed"`, `state_reason` is `Some("completed")`,
+    /// `Some("not_planned")`, or `None` (only meaningful alongside
+    /// `"closed"`; GitHub ignores it otherwise).
+    #[tracing::instrument(skip_all)]
+    pub async fn update_issue_state(&self, number: i32, state: &str, state_reason: Option<&str>) -> Result<()> {
+        let (token, repo) = self.credentials()?;
+
+        let response = self
+            .client
+            .patch(format!("{API_BASE}/repos/{repo}/issues/{number}"))
+            .bearer_auth(token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(&UpdateIssueBody { state, state_reason })
+            .send()
+            .await
+            .map_err(|e| AppError::ExternalApi(format!("GitHub unreachable: {e}")))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let detail = response.text().await.unwrap_or_default();
+            tracing::error!(%status, %detail, issue = number, "GitHub rejected the issue update request");
+            return Err(AppError::ExternalApi(format!("GitHub returned HTTP {status}")));
+        }
+
+        Ok(())
     }
 }

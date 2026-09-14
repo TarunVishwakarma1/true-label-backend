@@ -23,6 +23,16 @@ const MISS_TTL_SECS: usize = 600;
 /// per-minute budget is better spent on barcodes nobody has scanned yet.
 const OFF_STALE_AFTER_DAYS: i64 = 30;
 
+/// "Trending" is a ranking, not a fact — nobody needs it accurate to the
+/// second, and `lookup_count` moves on every scan. Caching it turns one of
+/// the most-hit reads in the app (shown on Home for every user) from a
+/// per-request table scan into a handful of Redis keys, one per country.
+const TRENDING_TTL_SECS: usize = 600;
+
+/// Same-shelf alternatives change only when nutrition facts do, which is
+/// rare — longer than search, which people retype differently every time.
+const ALTERNATIVES_TTL_SECS: usize = 1800;
+
 pub struct ProductService {
     db: PgPool,
     cache: CacheService,
@@ -328,7 +338,8 @@ impl ProductService {
 
     /// Same-category products ranked on one nutrient (or on overall
     /// grade). Products without a `category` never appear — an unmatched
-    /// shelf beats a wrong one. Empty is a legitimate answer.
+    /// shelf beats a wrong one. Empty is a legitimate answer. Cached — this
+    /// is a Product-detail read, hit on nearly every scan.
     #[tracing::instrument(skip(self), fields(barcode = %barcode, country = %country, sort_by = %sort_by))]
     pub async fn find_alternatives(
         &self,
@@ -336,8 +347,15 @@ impl ProductService {
         country: &str,
         sort_by: &str,
         limit: i64,
-    ) -> Result<Vec<ProductCard>> {
+    ) -> Result<(Vec<ProductCard>, bool)> {
         let limit = limit.clamp(1, 10);
+        let cache_key = format!("alts:{}:{}:{sort_by}:{limit}", barcode, country.to_uppercase());
+
+        if let Ok(Some(cached)) = self.cache.get(&cache_key).await
+            && let Ok(cards) = serde_json::from_str::<Vec<ProductCard>>(&cached)
+        {
+            return Ok((cards, true));
+        }
 
         let product = sqlx::query_as::<_, Product>(
             "SELECT * FROM products WHERE barcode = $1 AND country = $2",
@@ -350,7 +368,7 @@ impl ProductService {
         .ok_or(AppError::ProductNotFound)?;
 
         let Some(category) = product.category else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         };
 
         // Only these literals are ever interpolated — never the caller's
@@ -385,7 +403,12 @@ impl ProductService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        Ok(rows.into_iter().map(ProductCard::from).collect())
+        let cards: Vec<ProductCard> = rows.into_iter().map(ProductCard::from).collect();
+        let _ = self
+            .cache
+            .set(&cache_key, &serde_json::to_string(&cards).unwrap(), ALTERNATIVES_TTL_SECS)
+            .await;
+        Ok((cards, false))
     }
 
     /// Free-text search over what we already know (trigram-ranked), topped
@@ -456,8 +479,19 @@ impl ProductService {
 
     /// Most looked-up products in a country. Falls through to newest when
     /// nothing has been looked up yet, so a fresh deployment isn't blank.
+    /// Cached — this is a Home-screen read, hit by every user on every
+    /// open, for a ranking that has no reason to be second-fresh.
     #[tracing::instrument(skip(self), fields(country = %country))]
-    pub async fn trending(&self, country: &str, limit: i64) -> Result<Vec<ProductCard>> {
+    pub async fn trending(&self, country: &str, limit: i64) -> Result<(Vec<ProductCard>, bool)> {
+        let limit = limit.clamp(1, 30);
+        let cache_key = format!("trending:{}:{limit}", country.to_uppercase());
+
+        if let Ok(Some(cached)) = self.cache.get(&cache_key).await
+            && let Ok(cards) = serde_json::from_str::<Vec<ProductCard>>(&cached)
+        {
+            return Ok((cards, true));
+        }
+
         let rows: Vec<CardRow> = sqlx::query_as(
             "SELECT barcode, product_name, brand, image_url, nutriscore_grade, nova_group,
                     COALESCE(verified, false), nutrition_facts, NULL::float8
@@ -467,12 +501,17 @@ impl ProductService {
              LIMIT $2",
         )
         .bind(country)
-        .bind(limit.clamp(1, 30))
+        .bind(limit)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        Ok(rows.into_iter().map(ProductCard::from).collect())
+        let cards: Vec<ProductCard> = rows.into_iter().map(ProductCard::from).collect();
+        let _ = self
+            .cache
+            .set(&cache_key, &serde_json::to_string(&cards).unwrap(), TRENDING_TTL_SECS)
+            .await;
+        Ok((cards, false))
     }
 
     /// Feeds the Verify tab's queue: products this device hasn't already

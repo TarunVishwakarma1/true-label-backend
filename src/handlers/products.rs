@@ -62,11 +62,11 @@ pub async fn alternatives(
     State(state): State<AppState>,
     Query(query): Query<AlternativesQuery>,
 ) -> Result<Json<ApiResponse<Vec<ProductCard>>>> {
-    let alternatives = state
+    let (alternatives, cached) = state
         .product_service
         .find_alternatives(&query.barcode, &query.country, &query.sort_by, query.limit)
         .await?;
-    Ok(Json(ApiResponse::success(alternatives, false)))
+    Ok(Json(ApiResponse::success(alternatives, cached)))
 }
 
 pub async fn query_products(
@@ -87,11 +87,11 @@ pub async fn trending(
     State(state): State<AppState>,
     Query(query): Query<TrendingQuery>,
 ) -> Result<Json<ApiResponse<Vec<ProductCard>>>> {
-    let cards = state
+    let (cards, cached) = state
         .product_service
         .trending(&query.country, query.limit)
         .await?;
-    Ok(Json(ApiResponse::success(cards, false)))
+    Ok(Json(ApiResponse::success(cards, cached)))
 }
 
 pub async fn needs_verification(

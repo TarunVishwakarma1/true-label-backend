@@ -15,6 +15,8 @@ fn test_config() -> Env {
         apple_bundle_id: "com.tarun.truelable".to_string(),
         trusted_proxy_hops: 0,
         allowed_origins: Vec::new(),
+        github_token: None,
+        github_repo: None,
     }
 }
 

@@ -31,6 +31,12 @@ pub enum AppError {
     #[error("Unauthorized")]
     Unauthorized,
 
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
+
+    #[error("Conflict: {0}")]
+    Conflict(String),
+
     #[error("Too many requests")]
     TooManyRequests,
 
@@ -56,6 +62,11 @@ impl IntoResponse for AppError {
                 StatusCode::UNAUTHORIZED,
                 "Missing or invalid device token",
             ),
+            AppError::Forbidden(_) => (
+                StatusCode::FORBIDDEN,
+                "You don't have permission to do that",
+            ),
+            AppError::Conflict(_) => (StatusCode::CONFLICT, "Conflict"),
             AppError::TooManyRequests => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "Too many requests — slow down and try again shortly",

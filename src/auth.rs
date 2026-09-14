@@ -65,6 +65,53 @@ impl FromRequestParts<AppState> for Device {
     }
 }
 
+/// A signed-in dashboard staff account — a different identity system from
+/// `Device` above (named accounts with a password, not anonymous devices),
+/// but the same bearer-token mechanics: only the hash is stored, and the
+/// token never appears anywhere but the one response that issues it.
+#[derive(Debug, Clone)]
+pub struct AdminUser {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub role: String,
+}
+
+impl AdminUser {
+    /// Some actions (publishing a GitHub issue) are for admins specifically,
+    /// not every signed-in staff account.
+    pub fn require_admin(&self) -> Result<(), AppError> {
+        if self.role == "admin" {
+            Ok(())
+        } else {
+            Err(AppError::Forbidden("admin role required".to_string()))
+        }
+    }
+}
+
+impl FromRequestParts<AppState> for AdminUser {
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        let token = bearer(parts).ok_or(AppError::Unauthorized)?;
+
+        let row: Option<(Uuid, String, String)> = sqlx::query_as(
+            "SELECT id, name, role FROM dashboard_users WHERE token_hash = $1",
+        )
+        .bind(hash_token(&token))
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        match row {
+            Some((id, name, role)) => Ok(AdminUser { id, name, role }),
+            None => {
+                tracing::warn!("rejected a request carrying an unknown dashboard session token");
+                Err(AppError::Unauthorized)
+            }
+        }
+    }
+}
+
 /// For endpoints that work signed out but do better signed in — the
 /// verification queue excludes what you have already voted on, and can only
 /// do that if it knows who you are.

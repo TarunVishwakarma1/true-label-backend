@@ -29,6 +29,15 @@ governor = "0.10.4"
 jsonwebtoken = "9.3"
 sha2 = "0.10"
 rustls = { version = "0.23.44", features = ["ring"] }
+# Dashboard admin accounts carry a real password, worth phishing unlike a
+# device token, so it needs a slow, salted hash — not the sha2 digest used
+# for tokens above.
+argon2 = "0.5"
+# argon2's default features pull in password-hash's `rand_core` re-export,
+# but not `rand_core`'s own `getrandom` feature — without it `OsRng` isn't
+# compiled in at all. Cargo unifies this shared dependency, so enabling it
+# here is what makes `argon2::password_hash::rand_core::OsRng` exist.
+password-hash = { version = "0.5", features = ["getrandom"] }
 
 [dev-dependencies]
 axum-test = "21.1.0"

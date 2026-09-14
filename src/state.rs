@@ -1,5 +1,8 @@
 use crate::config::Env;
-use crate::services::{AppleAuth, CacheService, OcrService, ProductService, UserService};
+use crate::services::{
+    AdminService, AppleAuth, CacheService, CrashReportService, GitHubService, OcrService,
+    ProductService, UserService,
+};
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -12,6 +15,8 @@ pub struct AppState {
     pub product_service: Arc<ProductService>,
     pub ocr_service: Arc<OcrService>,
     pub user_service: Arc<UserService>,
+    pub admin_service: Arc<AdminService>,
+    pub crash_report_service: Arc<CrashReportService>,
     pub config: Arc<Env>,
 }
 
@@ -24,6 +29,9 @@ impl AppState {
             db.clone(),
             AppleAuth::new(config.apple_bundle_id.clone()),
         ));
+        let admin_service = Arc::new(AdminService::new(db.clone()));
+        let github = GitHubService::new(config.github_token.clone(), config.github_repo.clone());
+        let crash_report_service = Arc::new(CrashReportService::new(db.clone(), github));
 
         Self {
             db,
@@ -32,6 +40,8 @@ impl AppState {
             product_service,
             ocr_service,
             user_service,
+            admin_service,
+            crash_report_service,
             config: Arc::new(config),
         }
     }

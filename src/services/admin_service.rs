@@ -1,0 +1,268 @@
+//! Dashboard staff accounts: registration, login, and the session that
+//! comes out of both. A separate identity system from `UserService` — see
+//! the migration comment on `dashboard_users` for why.
+
+use crate::{
+    auth,
+    error::{AppError, Result},
+    models::{AdminProfile, AdminSession, DashboardUser, LoginRequest, RegisterRequest},
+};
+use argon2::{
+    Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
+    password_hash::{SaltString, rand_core::OsRng},
+};
+use chrono::NaiveDate;
+use sqlx::PgPool;
+
+const MIN_PASSWORD_LEN: usize = 8;
+const MAX_PASSWORD_LEN: usize = 256;
+const MAX_NAME_LEN: usize = 120;
+const MAX_EMAIL_LEN: usize = 255;
+const MAX_OCCUPATION_LEN: usize = 120;
+
+pub struct AdminService {
+    db: PgPool,
+}
+
+impl AdminService {
+    pub fn new(db: PgPool) -> Self {
+        Self { db }
+    }
+
+    /// The first account this dashboard ever creates is the admin — that is
+    /// what makes "I will be the admin" true without a manual database
+    /// edit. Every account after it starts as `member`.
+    ///
+    /// ponytail: this reads-then-writes the count without a lock, so two
+    /// truly simultaneous first registrations could both become admin.
+    /// Real risk only exists in the first few seconds this table has ever
+    /// existed; an advisory lock is the upgrade if that ever matters.
+    #[tracing::instrument(skip_all)]
+    pub async fn register(&self, req: &RegisterRequest) -> Result<AdminSession> {
+        let name = validate_name(&req.name)?;
+        let email = normalize_email(&req.email)?;
+        validate_password(&req.password)?;
+        let date_of_birth = req.date_of_birth.as_deref().map(parse_dob).transpose()?;
+        let occupation = req
+            .occupation
+            .as_deref()
+            .map(str::trim)
+            .filter(|o| !o.is_empty())
+            .map(|o| truncate(o, MAX_OCCUPATION_LEN));
+
+        let password_hash = hash_password(&req.password)?;
+        let token = auth::new_token();
+
+        let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dashboard_users")
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let role = if existing == 0 { "admin" } else { "member" };
+
+        let user = sqlx::query_as::<_, DashboardUser>(
+            "INSERT INTO dashboard_users
+               (name, email, date_of_birth, occupation, password_hash, role, token_hash, token_issued_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+             RETURNING *",
+        )
+        .bind(&name)
+        .bind(&email)
+        .bind(date_of_birth)
+        .bind(occupation.as_deref())
+        .bind(&password_hash)
+        .bind(role)
+        .bind(auth::hash_token(&token))
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| {
+            if is_unique_violation(&e) {
+                AppError::Conflict("an account with this email already exists".to_string())
+            } else {
+                AppError::Database(e.to_string())
+            }
+        })?;
+
+        tracing::info!(role = %user.role, "dashboard account registered");
+        Ok(AdminSession { token, profile: AdminProfile::from(user) })
+    }
+
+    /// Mints a fresh token and overwrites the stored one — a second login
+    /// (a different browser, say) signs the first one out. One active
+    /// session at a time is the simple choice for a handful of staff
+    /// accounts; a sessions table is the upgrade if that ever stops
+    /// being enough.
+    #[tracing::instrument(skip_all)]
+    pub async fn login(&self, req: &LoginRequest) -> Result<AdminSession> {
+        let email = normalize_email(&req.email)?;
+
+        let user = sqlx::query_as::<_, DashboardUser>(
+            "SELECT * FROM dashboard_users WHERE email = $1",
+        )
+        .bind(&email)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .ok_or(AppError::Unauthorized)?;
+
+        if !verify_password(&req.password, &user.password_hash)? {
+            tracing::warn!("rejected a dashboard login with a bad password");
+            return Err(AppError::Unauthorized);
+        }
+
+        let token = auth::new_token();
+        let user = sqlx::query_as::<_, DashboardUser>(
+            "UPDATE dashboard_users SET token_hash = $2, token_issued_at = NOW(), updated_at = NOW()
+             WHERE id = $1 RETURNING *",
+        )
+        .bind(user.id)
+        .bind(auth::hash_token(&token))
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        tracing::info!("dashboard login");
+        Ok(AdminSession { token, profile: AdminProfile::from(user) })
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub async fn profile(&self, user_id: uuid::Uuid) -> Result<AdminProfile> {
+        let user = sqlx::query_as::<_, DashboardUser>("SELECT * FROM dashboard_users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .ok_or(AppError::Unauthorized)?;
+        Ok(AdminProfile::from(user))
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub async fn logout(&self, user_id: uuid::Uuid) -> Result<()> {
+        sqlx::query(
+            "UPDATE dashboard_users SET token_hash = NULL, token_issued_at = NULL, updated_at = NOW()
+             WHERE id = $1",
+        )
+        .bind(user_id)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(())
+    }
+}
+
+fn hash_password(password: &str) -> Result<String> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| AppError::Internal(format!("password hashing failed: {e}")))
+}
+
+fn verify_password(password: &str, hash: &str) -> Result<bool> {
+    let parsed = PasswordHash::new(hash)
+        .map_err(|e| AppError::Internal(format!("stored password hash unreadable: {e}")))?;
+    Ok(Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok())
+}
+
+fn is_unique_violation(err: &sqlx::Error) -> bool {
+    matches!(err, sqlx::Error::Database(db) if db.is_unique_violation())
+}
+
+fn validate_name(name: &str) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > MAX_NAME_LEN {
+        return Err(AppError::InvalidRequest(format!(
+            "name must be 1-{MAX_NAME_LEN} characters"
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Lowercased for storage so `Tarun@x.com` and `tarun@x.com` are the same
+/// account regardless of what the client sends. Not a full RFC 5322
+/// validator — this only needs to reject obvious garbage before it reaches
+/// the database, not police every edge case of the email spec.
+fn normalize_email(email: &str) -> Result<String> {
+    let trimmed = email.trim();
+    let looks_like_email = trimmed.len() <= MAX_EMAIL_LEN
+        && trimmed.matches('@').count() == 1
+        && !trimmed.starts_with('@')
+        && !trimmed.ends_with('@')
+        && !trimmed.contains(char::is_whitespace)
+        && trimmed.split('@').nth(1).is_some_and(|domain| domain.contains('.'));
+
+    if looks_like_email {
+        Ok(trimmed.to_lowercase())
+    } else {
+        Err(AppError::InvalidRequest("invalid email address".to_string()))
+    }
+}
+
+fn validate_password(password: &str) -> Result<()> {
+    if (MIN_PASSWORD_LEN..=MAX_PASSWORD_LEN).contains(&password.len()) {
+        Ok(())
+    } else {
+        Err(AppError::InvalidRequest(format!(
+            "password must be {MIN_PASSWORD_LEN}-{MAX_PASSWORD_LEN} characters"
+        )))
+    }
+}
+
+fn parse_dob(raw: &str) -> Result<NaiveDate> {
+    let date = NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d")
+        .map_err(|_| AppError::InvalidRequest("date_of_birth must be YYYY-MM-DD".to_string()))?;
+    if date > chrono::Utc::now().date_naive() {
+        return Err(AppError::InvalidRequest("date_of_birth cannot be in the future".to_string()));
+    }
+    Ok(date)
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_hashed_password_verifies_against_itself_and_nothing_else() {
+        let hash = hash_password("correct horse battery staple").unwrap();
+        assert_ne!(hash, "correct horse battery staple");
+        assert!(verify_password("correct horse battery staple", &hash).unwrap());
+        assert!(!verify_password("wrong password", &hash).unwrap());
+    }
+
+    #[test]
+    fn emails_are_normalized_and_obviously_invalid_ones_rejected() {
+        assert_eq!(normalize_email("Tarun@Example.com").unwrap(), "tarun@example.com");
+        assert_eq!(normalize_email("  tarun@example.com  ").unwrap(), "tarun@example.com");
+        assert!(normalize_email("not-an-email").is_err());
+        assert!(normalize_email("@example.com").is_err());
+        assert!(normalize_email("tarun@").is_err());
+        assert!(normalize_email("tarun@localhost").is_err());
+        assert!(normalize_email("two@at@signs.com").is_err());
+        assert!(normalize_email("has space@example.com").is_err());
+    }
+
+    #[test]
+    fn password_length_is_bounded() {
+        assert!(validate_password("short").is_err());
+        assert!(validate_password("a very reasonable password").is_ok());
+        assert!(validate_password(&"a".repeat(300)).is_err());
+    }
+
+    #[test]
+    fn date_of_birth_must_be_a_real_past_date() {
+        assert!(parse_dob("1995-06-12").is_ok());
+        assert!(parse_dob("not-a-date").is_err());
+        assert!(parse_dob("2099-01-01").is_err());
+    }
+
+    #[test]
+    fn names_are_trimmed_and_bounded() {
+        assert_eq!(validate_name("  Tarun  ").unwrap(), "Tarun");
+        assert!(validate_name("").is_err());
+        assert!(validate_name("   ").is_err());
+        assert!(validate_name(&"a".repeat(200)).is_err());
+    }
+}

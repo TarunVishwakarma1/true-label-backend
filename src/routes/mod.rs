@@ -120,7 +120,7 @@ fn cors(config: &Env) -> CorsLayer {
 
     CorsLayer::new()
         .allow_origin(origins)
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::PATCH, Method::DELETE])
         .allow_headers([AUTHORIZATION, CONTENT_TYPE])
         .max_age(Duration::from_secs(3600))
 }

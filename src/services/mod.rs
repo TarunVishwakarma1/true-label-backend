@@ -1,12 +1,18 @@
+pub mod admin_service;
 pub mod apple_auth;
 pub mod cache_service;
+pub mod crash_report_service;
+pub mod github_service;
 pub mod ocr_service;
 pub mod openfoodfacts;
 pub mod product_service;
 pub mod user_service;
 
+pub use admin_service::AdminService;
 pub use apple_auth::AppleAuth;
 pub use cache_service::CacheService;
+pub use crash_report_service::CrashReportService;
+pub use github_service::GitHubService;
 pub use ocr_service::OcrService;
 pub use openfoodfacts::OffClient;
 pub use product_service::ProductService;

@@ -20,6 +20,13 @@ pub struct Env {
     /// client sends no `Origin`, so an empty list costs the app nothing and
     /// stops the API being used as somebody else's free backend.
     pub allowed_origins: Vec<String>,
+    /// A GitHub personal access token with `repo` scope (or fine-grained
+    /// "Issues: write" on `github_repo` alone), used only by the dashboard's
+    /// "publish as GitHub issue" button. Absent means that one endpoint
+    /// fails with a clear error rather than the whole app refusing to boot.
+    pub github_token: Option<String>,
+    /// `owner/repo` the dashboard files crash-report issues against.
+    pub github_repo: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -91,6 +98,9 @@ impl Env {
             .map(String::from)
             .collect();
 
+        let github_token = std::env::var("GITHUB_TOKEN").ok().filter(|v| !v.is_empty());
+        let github_repo = std::env::var("GITHUB_REPO").ok().filter(|v| !v.is_empty());
+
         Ok(Self {
             database_url,
             redis_url,
@@ -103,6 +113,8 @@ impl Env {
             apple_bundle_id,
             trusted_proxy_hops,
             allowed_origins,
+            github_token,
+            github_repo,
         })
     }
 

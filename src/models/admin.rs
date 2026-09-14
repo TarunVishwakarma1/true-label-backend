@@ -23,6 +23,7 @@ pub struct AdminProfile {
     pub id: Uuid,
     pub name: String,
     pub email: String,
+    pub occupation: Option<String>,
     pub role: String,
     pub created_at: DateTime<Utc>,
 }
@@ -33,6 +34,7 @@ impl From<DashboardUser> for AdminProfile {
             id: u.id,
             name: u.name,
             email: u.email,
+            occupation: u.occupation,
             role: u.role,
             created_at: u.created_at,
         }
@@ -65,4 +67,9 @@ pub struct RegisterRequest {
 pub struct LoginRequest {
     pub email: String,
     pub password: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateRoleRequest {
+    pub role: String,
 }

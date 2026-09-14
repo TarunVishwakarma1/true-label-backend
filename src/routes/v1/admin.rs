@@ -25,3 +25,10 @@ pub fn admin_crash_reports_router() -> Router<AppState> {
         .route("/{id}", patch(crate::handlers::crash_reports::update))
         .route("/{id}/github-issue", post(crate::handlers::crash_reports::publish_to_github))
 }
+
+/// Who's on the team. Changing a role is admin-gated in the handler.
+pub fn admin_team_router() -> Router<AppState> {
+    Router::new()
+        .route("/", get(crate::handlers::admin_auth::list_team))
+        .route("/{id}/role", patch(crate::handlers::admin_auth::update_role))
+}

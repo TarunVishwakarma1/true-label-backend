@@ -16,4 +16,5 @@ pub fn v1_router() -> Router<AppState> {
         .nest("/crash-reports", crash_reports::crash_reports_router())
         .nest("/admin/auth", admin::admin_auth_router())
         .nest("/admin/crash-reports", admin::admin_crash_reports_router())
+        .nest("/admin/team", admin::admin_team_router())
 }

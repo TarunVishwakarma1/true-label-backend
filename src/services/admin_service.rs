@@ -7,6 +7,7 @@ use crate::{
     error::{AppError, Result},
     models::{AdminProfile, AdminSession, DashboardUser, LoginRequest, RegisterRequest},
 };
+use uuid::Uuid;
 use argon2::{
     Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
     password_hash::{SaltString, rand_core::OsRng},
@@ -146,6 +147,59 @@ impl AdminService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
         Ok(())
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub async fn list_team(&self) -> Result<Vec<AdminProfile>> {
+        let users = sqlx::query_as::<_, DashboardUser>("SELECT * FROM dashboard_users ORDER BY created_at ASC")
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(users.into_iter().map(AdminProfile::from).collect())
+    }
+
+    /// Refuses to demote the last admin — otherwise the team can lock
+    /// itself out with no way back in short of a direct database edit.
+    #[tracing::instrument(skip_all)]
+    pub async fn update_role(&self, user_id: Uuid, role: &str) -> Result<AdminProfile> {
+        let role = one_of("role", role, &["admin", "member"])?;
+
+        let target = sqlx::query_as::<_, DashboardUser>("SELECT * FROM dashboard_users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .ok_or(AppError::ProductNotFound)?;
+
+        if target.role == "admin" && role != "admin" {
+            let admins: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dashboard_users WHERE role = 'admin'")
+                .fetch_one(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            if admins <= 1 {
+                return Err(AppError::Conflict("can't demote the last admin".to_string()));
+            }
+        }
+
+        let user = sqlx::query_as::<_, DashboardUser>(
+            "UPDATE dashboard_users SET role = $2, updated_at = NOW() WHERE id = $1 RETURNING *",
+        )
+        .bind(user_id)
+        .bind(&role)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        tracing::info!(role = %user.role, "dashboard role updated");
+        Ok(AdminProfile::from(user))
+    }
+}
+
+fn one_of(field: &str, value: &str, allowed: &[&str]) -> Result<String> {
+    if allowed.contains(&value) {
+        Ok(value.to_string())
+    } else {
+        Err(AppError::InvalidRequest(format!("{field} must be one of: {}", allowed.join(", "))))
     }
 }
 

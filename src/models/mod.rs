@@ -6,7 +6,7 @@ pub mod response;
 pub mod user;
 pub mod verification;
 
-pub use admin::{AdminProfile, AdminSession, DashboardUser, LoginRequest, RegisterRequest};
+pub use admin::{AdminProfile, AdminSession, DashboardUser, LoginRequest, RegisterRequest, UpdateRoleRequest};
 pub use crash_report::{
     CrashReport, CrashReportPage, GitHubIssueRef, ListCrashReportsQuery, SubmitCrashReportRequest,
     UpdateCrashReportRequest,

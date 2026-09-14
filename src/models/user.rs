@@ -147,3 +147,39 @@ pub struct UpdateProfileRequest {
     /// with Apple isn't available to it.
     pub display_name: Option<String>,
 }
+
+fn default_admin_limit() -> i64 {
+    50
+}
+
+/// Read-only admin browsing — closes the gap where the only way to answer
+/// "why can't this person restore Plus" was a direct `psql` session.
+#[derive(Debug, Deserialize)]
+pub struct ListUsersQuery {
+    /// Matched against device_id, email, and display_name, case-insensitively.
+    pub q: Option<String>,
+    /// `true` = currently-active Plus only, `false` = not currently active,
+    /// omitted = both. Mirrors `SubscriptionResponse::from`'s exact
+    /// "no expiry means still on" rule, computed in SQL so it can't drift.
+    pub plus_active: Option<bool>,
+    #[serde(default = "default_admin_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminUserPage {
+    pub items: Vec<User>,
+    pub total: i64,
+}
+
+/// The full row plus its contribution numbers in one response — the same
+/// "one round trip, not three" reasoning `UserService::stats` already
+/// documents applies here too.
+#[derive(Debug, Serialize)]
+pub struct AdminUserDetail {
+    #[serde(flatten)]
+    pub user: User,
+    pub stats: ContributionStats,
+}

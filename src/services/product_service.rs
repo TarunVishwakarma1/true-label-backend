@@ -276,6 +276,7 @@ impl ProductService {
         let off_client = Arc::clone(&self.off_client);
         let barcode = product.barcode.clone();
         let country = product.country.clone();
+        let product_id = product.id;
 
         tokio::spawn(async move {
             let Some(json) = off_client.get_product_if_free(&barcode, &country).await else {
@@ -330,7 +331,24 @@ impl ProductService {
                     let _ = cache.delete(&CacheService::cache_key(&barcode, &country)).await;
                     tracing::info!(barcode = %barcode, "refreshed from Open Food Facts");
                 }
-                Err(e) => tracing::warn!(error = %e, barcode = %barcode, "refresh failed"),
+                Err(e) => {
+                    tracing::warn!(error = %e, barcode = %barcode, "refresh failed");
+                    // Only this branch, not "OFF doesn't have this barcode"
+                    // or "no rate-limit budget right now" (both routine,
+                    // both common) — this is a successful OFF fetch that
+                    // then failed to write to our own database, the one
+                    // outcome actually worth an operator's attention.
+                    audit::record(
+                        &db,
+                        None,
+                        "system",
+                        "sync.off_refresh_failed",
+                        "product",
+                        product_id,
+                        serde_json::json!({ "barcode": barcode, "error": e.to_string() }),
+                    )
+                    .await;
+                }
             }
         });
     }

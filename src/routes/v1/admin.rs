@@ -56,3 +56,12 @@ pub fn admin_products_router() -> Router<AppState> {
         .route("/{id}", patch(crate::handlers::admin_products::update))
         .route("/{id}/verify", post(crate::handlers::admin_products::verify))
 }
+
+/// Read-only — any signed-in staff account. Closes the gap where "why can't
+/// this person restore Plus" meant a direct database session; no mutation
+/// endpoints here since that gap was about visibility, not editing.
+pub fn admin_users_router() -> Router<AppState> {
+    Router::new()
+        .route("/", get(crate::handlers::admin_users::list))
+        .route("/{device_id}", get(crate::handlers::admin_users::get))
+}

@@ -2,8 +2,8 @@ use crate::{
     auth,
     error::{AppError, Result},
     models::{
-        ContributionStats, DeviceRegistration, LinkAccountRequest, ProfileResponse,
-        SubscriptionResponse, UpdateProfileRequest, User,
+        AdminUserDetail, AdminUserPage, ContributionStats, DeviceRegistration, LinkAccountRequest,
+        ListUsersQuery, ProfileResponse, SubscriptionResponse, UpdateProfileRequest, User,
     },
     services::AppleAuth,
 };
@@ -307,6 +307,64 @@ impl UserService {
         validate_device_id(device_id)?;
         let profile = self.get_or_create(device_id, "IN").await?;
         Ok(profile.subscription)
+    }
+
+    /// Any signed-in staff account can browse — read-only, same posture as
+    /// crash reports and products. Mirrors `CrashReportService::list()`'s
+    /// COALESCE-filter + COUNT(*) shape.
+    #[tracing::instrument(skip(self, query))]
+    pub async fn list_admin(&self, query: &ListUsersQuery) -> Result<AdminUserPage> {
+        let limit = query.limit.clamp(1, 200);
+        let offset = query.offset.max(0);
+        let q = query.q.as_deref().map(str::trim).filter(|q| !q.is_empty());
+
+        // The "active" expression matches `SubscriptionResponse::from`'s
+        // exact rule (no expiry means still on) so this filter can't drift
+        // from what the client itself would call active.
+        let items = sqlx::query_as::<_, User>(
+            "SELECT * FROM users
+             WHERE ($1::text IS NULL OR device_id ILIKE '%' || $1 || '%' OR email ILIKE '%' || $1 || '%' OR display_name ILIKE '%' || $1 || '%')
+               AND ($2::boolean IS NULL OR
+                    (plus_since IS NOT NULL AND (plus_expires_at IS NULL OR plus_expires_at > NOW())) = $2)
+             ORDER BY created_at DESC
+             LIMIT $3 OFFSET $4",
+        )
+        .bind(q)
+        .bind(query.plus_active)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM users
+             WHERE ($1::text IS NULL OR device_id ILIKE '%' || $1 || '%' OR email ILIKE '%' || $1 || '%' OR display_name ILIKE '%' || $1 || '%')
+               AND ($2::boolean IS NULL OR
+                    (plus_since IS NOT NULL AND (plus_expires_at IS NULL OR plus_expires_at > NOW())) = $2)",
+        )
+        .bind(q)
+        .bind(query.plus_active)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(AdminUserPage { items, total })
+    }
+
+    /// The full row plus contribution numbers, one round trip — see
+    /// `AdminUserDetail`'s doc comment.
+    #[tracing::instrument(skip(self))]
+    pub async fn get_admin(&self, device_id: &str) -> Result<AdminUserDetail> {
+        validate_device_id(device_id)?;
+        let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE device_id = $1")
+            .bind(device_id)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .ok_or(AppError::ProductNotFound)?;
+        let stats = self.stats(device_id).await?;
+        Ok(AdminUserDetail { user, stats })
     }
 }
 

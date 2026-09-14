@@ -10,6 +10,7 @@ use crate::{
     services::openfoodfacts::OffClient,
 };
 use chrono::Utc;
+use serde::Serialize;
 use serde_json::json;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -51,6 +52,18 @@ impl ProductService {
             db,
             cache,
             off_client: Arc::new(OffClient::new()),
+        }
+    }
+
+    /// Best-effort: a serialization failure means this response just
+    /// doesn't get cached, not a panic on a path that already has the
+    /// correct data in hand and is about to return it successfully anyway.
+    async fn cache_json<T: Serialize>(&self, key: &str, value: &T, ttl_secs: usize) {
+        match serde_json::to_string(value) {
+            Ok(json) => {
+                let _ = self.cache.set(key, &json, ttl_secs).await;
+            }
+            Err(e) => tracing::warn!(error = %e, key, "failed to serialize value for caching"),
         }
     }
 
@@ -99,10 +112,7 @@ impl ProductService {
             tracing::info!(product_id = %p.id, source = %p.source, "database hit");
             self.refresh_if_stale(&p);
             let response = ProductResponse::from(p);
-            let _ = self
-                .cache
-                .set(&cache_key, &serde_json::to_string(&response).unwrap(), PRODUCT_TTL_SECS)
-                .await;
+            self.cache_json(&cache_key, &response, PRODUCT_TTL_SECS).await;
             self.bump_lookup(&query.barcode);
             return Ok((response, false));
         }
@@ -169,10 +179,7 @@ impl ProductService {
                     "created product from Open Food Facts"
                 );
 
-                let _ = self
-                    .cache
-                    .set(&cache_key, &serde_json::to_string(&response).unwrap(), PRODUCT_TTL_SECS)
-                    .await;
+                self.cache_json(&cache_key, &response, PRODUCT_TTL_SECS).await;
                 self.bump_lookup(&query.barcode);
                 Ok((response, false))
             }
@@ -410,10 +417,7 @@ impl ProductService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         let cards: Vec<ProductCard> = rows.into_iter().map(ProductCard::from).collect();
-        let _ = self
-            .cache
-            .set(&cache_key, &serde_json::to_string(&cards).unwrap(), ALTERNATIVES_TTL_SECS)
-            .await;
+        self.cache_json(&cache_key, &cards, ALTERNATIVES_TTL_SECS).await;
         Ok((cards, false))
     }
 
@@ -476,10 +480,7 @@ impl ProductService {
             }
         }
 
-        let _ = self
-            .cache
-            .set(&cache_key, &serde_json::to_string(&cards).unwrap(), 600)
-            .await;
+        self.cache_json(&cache_key, &cards, 600).await;
         Ok((cards, false))
     }
 
@@ -513,10 +514,7 @@ impl ProductService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         let cards: Vec<ProductCard> = rows.into_iter().map(ProductCard::from).collect();
-        let _ = self
-            .cache
-            .set(&cache_key, &serde_json::to_string(&cards).unwrap(), TRENDING_TTL_SECS)
-            .await;
+        self.cache_json(&cache_key, &cards, TRENDING_TTL_SECS).await;
         Ok((cards, false))
     }
 
@@ -532,6 +530,10 @@ impl ProductService {
         device_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<VerificationCandidate>> {
+        // Same ceiling as `trending`, which shares this query's default (10)
+        // — every sibling card-feed method clamps its caller-supplied limit,
+        // this one didn't.
+        let limit = limit.clamp(1, 30);
         let rows: Vec<(String, String, Option<String>, Option<String>, Option<String>, serde_json::Value, i32)> = sqlx::query_as(
             "SELECT barcode, product_name, brand, image_url, nutriscore_grade, nutrition_facts, verification_count
              FROM products

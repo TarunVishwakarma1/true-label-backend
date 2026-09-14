@@ -103,8 +103,10 @@ pub async fn trending(
 pub async fn needs_verification(
     State(state): State<AppState>,
     device: MaybeDevice,
+    ClientIp(ip): ClientIp,
     Query(query): Query<NeedsVerificationQuery>,
 ) -> Result<Json<ApiResponse<Vec<VerificationCandidate>>>> {
+    state.limit("needs_verification", &subject(&device, &ip), LOOKUPS_PER_HOUR, HOUR).await?;
     // Works signed out, but can only skip what you have already voted on if
     // it knows who you are.
     let candidates = state

@@ -199,15 +199,11 @@ impl AdminService {
             .map_err(|e| AppError::Database(e.to_string()))?
             .ok_or(AppError::ProductNotFound)?;
 
-        if target.role == "admin" && role != "admin" {
-            let admins: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dashboard_users WHERE role = 'admin'")
-                .fetch_one(&self.db)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?;
-            if admins <= 1 {
-                return Err(AppError::Conflict("can't demote the last admin".to_string()));
-            }
-        }
+        let admins: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dashboard_users WHERE role = 'admin'")
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        demotion_guard(&target.role, &role, admins)?;
 
         let user = sqlx::query_as::<_, DashboardUser>(
             "UPDATE dashboard_users SET role = $2, updated_at = NOW() WHERE id = $1 RETURNING *",
@@ -302,10 +298,6 @@ impl AdminService {
     /// for the more permanent version of the same mistake.
     #[tracing::instrument(skip_all)]
     pub async fn remove_member(&self, actor: &AdminUser, target_id: Uuid) -> Result<()> {
-        if target_id == actor.id {
-            return Err(AppError::Conflict("can't remove your own account".to_string()));
-        }
-
         let target = sqlx::query_as::<_, DashboardUser>("SELECT * FROM dashboard_users WHERE id = $1")
             .bind(target_id)
             .fetch_optional(&self.db)
@@ -313,15 +305,11 @@ impl AdminService {
             .map_err(|e| AppError::Database(e.to_string()))?
             .ok_or(AppError::ProductNotFound)?;
 
-        if target.role == "admin" {
-            let admins: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dashboard_users WHERE role = 'admin'")
-                .fetch_one(&self.db)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?;
-            if admins <= 1 {
-                return Err(AppError::Conflict("can't remove the last admin".to_string()));
-            }
-        }
+        let admins: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dashboard_users WHERE role = 'admin'")
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        removal_guard(actor.id, target_id, &target.role, admins)?;
 
         sqlx::query("DELETE FROM dashboard_users WHERE id = $1")
             .bind(target_id)
@@ -462,6 +450,29 @@ fn truncate(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
+/// Pulled out of `update_role` as a pure decision so it's testable without
+/// a database — the only thing that ever changes the answer is the three
+/// values here, not anything else `update_role` does.
+fn demotion_guard(target_role: &str, new_role: &str, admin_count: i64) -> Result<()> {
+    if target_role == "admin" && new_role != "admin" && admin_count <= 1 {
+        return Err(AppError::Conflict("can't demote the last admin".to_string()));
+    }
+    Ok(())
+}
+
+/// Pulled out of `remove_member` the same way `demotion_guard` was pulled
+/// out of `update_role` — same reasoning, the more permanent version of the
+/// same mistake.
+fn removal_guard(actor_id: Uuid, target_id: Uuid, target_role: &str, admin_count: i64) -> Result<()> {
+    if target_id == actor_id {
+        return Err(AppError::Conflict("can't remove your own account".to_string()));
+    }
+    if target_role == "admin" && admin_count <= 1 {
+        return Err(AppError::Conflict("can't remove the last admin".to_string()));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,5 +517,56 @@ mod tests {
         assert!(validate_name("").is_err());
         assert!(validate_name("   ").is_err());
         assert!(validate_name(&"a".repeat(200)).is_err());
+    }
+
+    #[test]
+    fn demoting_the_last_admin_is_refused() {
+        assert!(demotion_guard("admin", "member", 1).is_err());
+    }
+
+    #[test]
+    fn demoting_an_admin_is_fine_when_others_remain() {
+        assert!(demotion_guard("admin", "member", 2).is_ok());
+    }
+
+    #[test]
+    fn demoting_a_member_never_checks_admin_count() {
+        // Already not an admin — promoting/demoting a member is always
+        // fine regardless of how many admins exist, including zero.
+        assert!(demotion_guard("member", "admin", 0).is_ok());
+        assert!(demotion_guard("member", "member", 0).is_ok());
+    }
+
+    #[test]
+    fn keeping_an_admin_admin_is_always_fine() {
+        assert!(demotion_guard("admin", "admin", 1).is_ok());
+    }
+
+    #[test]
+    fn removing_yourself_is_refused_even_as_the_only_admin_or_not() {
+        let id = Uuid::new_v4();
+        assert!(removal_guard(id, id, "member", 5).is_err());
+        assert!(removal_guard(id, id, "admin", 5).is_err());
+    }
+
+    #[test]
+    fn removing_the_last_admin_is_refused() {
+        let actor = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        assert!(removal_guard(actor, target, "admin", 1).is_err());
+    }
+
+    #[test]
+    fn removing_an_admin_is_fine_when_others_remain() {
+        let actor = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        assert!(removal_guard(actor, target, "admin", 2).is_ok());
+    }
+
+    #[test]
+    fn removing_a_member_never_checks_admin_count() {
+        let actor = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        assert!(removal_guard(actor, target, "member", 0).is_ok());
     }
 }

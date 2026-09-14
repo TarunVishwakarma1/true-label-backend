@@ -31,7 +31,11 @@ impl AppState {
         ));
         let admin_service = Arc::new(AdminService::new(db.clone()));
         let github = GitHubService::new(config.github_token.clone(), config.github_repo.clone());
-        let crash_report_service = Arc::new(CrashReportService::new(db.clone(), github));
+        let crash_report_service = Arc::new(CrashReportService::new(
+            db.clone(),
+            github,
+            config.dashboard_url.clone(),
+        ));
 
         Self {
             db,

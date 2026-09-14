@@ -27,6 +27,10 @@ pub struct Env {
     pub github_token: Option<String>,
     /// `owner/repo` the dashboard files crash-report issues against.
     pub github_repo: Option<String>,
+    /// The dashboard's own public URL, e.g. `https://dashboard.truelabel.fun`
+    /// — used only to link a filed GitHub issue back to the crash report it
+    /// came from. Absent just means that one link is omitted, not an error.
+    pub dashboard_url: Option<String>,
     /// `warn_about_exposure`'s loopback check assumes this process's own
     /// bind address is what stands between it and the public internet —
     /// true for a droplet (backend + nginx, same host), false inside a
@@ -108,6 +112,12 @@ impl Env {
 
         let github_token = std::env::var("GITHUB_TOKEN").ok().filter(|v| !v.is_empty());
         let github_repo = std::env::var("GITHUB_REPO").ok().filter(|v| !v.is_empty());
+        // Trailing slash trimmed so issue_body's `{dashboard_url}/dashboard/...`
+        // never produces a doubled `//`.
+        let dashboard_url = std::env::var("DASHBOARD_URL")
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty());
 
         let trust_container_network = std::env::var("TRUST_CONTAINER_NETWORK")
             .ok()
@@ -127,6 +137,7 @@ impl Env {
             allowed_origins,
             github_token,
             github_repo,
+            dashboard_url,
             trust_container_network,
         })
     }

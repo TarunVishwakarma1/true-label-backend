@@ -22,11 +22,12 @@ const MAX_SHORT_FIELD_LEN: usize = 100;
 pub struct CrashReportService {
     db: PgPool,
     github: GitHubService,
+    dashboard_url: Option<String>,
 }
 
 impl CrashReportService {
-    pub fn new(db: PgPool, github: GitHubService) -> Self {
-        Self { db, github }
+    pub fn new(db: PgPool, github: GitHubService, dashboard_url: Option<String>) -> Self {
+        Self { db, github, dashboard_url }
     }
 
     /// Unauthenticated — a crash can happen before a device finishes
@@ -199,8 +200,20 @@ impl CrashReportService {
             return Err(AppError::Conflict("already published to GitHub".to_string()));
         }
 
+        // reported_by is a dashboard_users id, not a name — resolve it so a
+        // manually-filed report reads as "filed by a real person", the same
+        // way an actual user's issue would carry a name, not a bare UUID.
+        let reporter_name = match report.reported_by {
+            Some(user_id) => sqlx::query_scalar::<_, String>("SELECT name FROM dashboard_users WHERE id = $1")
+                .bind(user_id)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?,
+            None => None,
+        };
+
         let title = format!("[{}] {}", report.platform, report.title);
-        let body = issue_body(&report);
+        let body = issue_body(&report, reporter_name.as_deref(), self.dashboard_url.as_deref());
         let labels: Vec<&str> = vec!["crash-report", report.platform.as_str(), report.severity.as_str()];
         let issue = self.github.create_issue(&title, &body, &labels).await?;
 
@@ -220,15 +233,28 @@ impl CrashReportService {
     }
 }
 
-fn issue_body(report: &CrashReport) -> String {
+/// Reads like a person filed it, because as much of it as the data allows
+/// now actually is a person: who reported it (resolved from `reported_by`,
+/// not left as a bare id), whether it was them or the app itself, and every
+/// field the report actually carries — not just the four that happened to
+/// be in the original version of this function. Previously silent gaps
+/// (`source`, `reported_by`, `device_id`, `metadata`) all show up here now.
+fn issue_body(report: &CrashReport, reporter_name: Option<&str>, dashboard_url: Option<&str>) -> String {
     let mut body = String::new();
-    if let Some(description) = &report.description {
-        body.push_str(description);
-        body.push_str("\n\n");
+
+    body.push_str("## Description\n\n");
+    match &report.description {
+        Some(description) if !description.trim().is_empty() => {
+            body.push_str(description);
+        }
+        _ => body.push_str("_No description was provided with this report._"),
     }
-    body.push_str("| | |\n|---|---|\n");
+    body.push_str("\n\n");
+
+    body.push_str("## Environment\n\n| | |\n|---|---|\n");
     body.push_str(&format!("| Platform | {} |\n", report.platform));
-    body.push_str(&format!("| Severity | {} |\n", report.severity));
+    body.push_str(&format!("| Severity | {} |\n", severity_label(&report.severity)));
+    body.push_str(&format!("| Source | {} |\n", source_label(&report.source, reporter_name)));
     if let Some(v) = &report.app_version {
         body.push_str(&format!("| App version | {v} |\n"));
     }
@@ -239,13 +265,64 @@ fn issue_body(report: &CrashReport) -> String {
         body.push_str(&format!("| Device | {v} |\n"));
     }
     body.push_str(&format!("| Reported | {} |\n", report.created_at.to_rfc3339()));
+    if let Some(device_id) = &report.device_id {
+        // A loose correlation id, not an identity — same framing as the API
+        // docs use elsewhere. Useful for spotting "this device again" across
+        // separate issues without being anything to look someone up by.
+        body.push_str(&format!("| Device correlation id | `{device_id}` |\n"));
+    }
+
     if let Some(trace) = &report.stack_trace {
-        body.push_str("\n<details><summary>Stack trace</summary>\n\n```\n");
+        body.push_str("\n## Stack Trace\n\n<details><summary>Expand</summary>\n\n```\n");
         body.push_str(trace);
         body.push_str("\n```\n</details>\n");
     }
-    body.push_str(&format!("\n_Filed from the TrueLabel dashboard — crash report `{}`._", report.id));
+
+    if !report.metadata.is_null() && report.metadata != serde_json::json!({}) {
+        let pretty = serde_json::to_string_pretty(&report.metadata).unwrap_or_default();
+        body.push_str("\n## Additional Metadata\n\n<details><summary>Expand</summary>\n\n```json\n");
+        body.push_str(&pretty);
+        body.push_str("\n```\n</details>\n");
+    }
+
+    body.push_str("\n---\n");
+    body.push_str(&format!("Filed from the TrueLabel dashboard — crash report `{}`.", report.id));
+    if let Some(base) = dashboard_url {
+        body.push_str(&format!(" [View in dashboard]({base}/dashboard/crash-reports/{}).", report.id));
+    }
     body
+}
+
+fn severity_label(severity: &str) -> String {
+    let emoji = match severity {
+        "critical" => "🔴",
+        "high" => "🟠",
+        "medium" => "🟡",
+        "low" => "🟢",
+        _ => "⚪",
+    };
+    format!("{emoji} {}", capitalize(severity))
+}
+
+/// "as if an actual user posted this" is exactly backwards for an app-
+/// sourced crash — nobody typed it, MetricKit did, and saying so plainly is
+/// more honest than dressing it up as a person. A manual report is the one
+/// case a name belongs here, so that one gets it.
+fn source_label(source: &str, reporter_name: Option<&str>) -> String {
+    match (source, reporter_name) {
+        ("manual", Some(name)) => format!("✍️ Filed manually by **{name}**"),
+        ("manual", None) => "✍️ Filed manually by a staff member".to_string(),
+        ("app", _) => "🤖 Reported automatically by the app (MetricKit)".to_string(),
+        (other, _) => capitalize(other),
+    }
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
 }
 
 /// Every field `submit` and `create_manual` share — only where the row ends

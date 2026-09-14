@@ -10,9 +10,17 @@ use axum::{
     extract::{ConnectInfo, FromRequestParts},
     http::request::Parts,
 };
+use chrono::{Duration, Utc};
 use sha2::{Digest, Sha256};
 use std::net::{IpAddr, SocketAddr};
 use uuid::Uuid;
+
+/// A staff session dies on its own after this long, even if nobody logs
+/// out — a token from a lost laptop or a browser tab left open somewhere
+/// stops working eventually instead of staying valid forever. Long enough
+/// that a handful of staff aren't re-logging in constantly; short enough
+/// that "forgot to log out on a shared machine" isn't a standing risk.
+const ADMIN_SESSION_TTL_DAYS: i64 = 30;
 
 /// 244 bits from the OS random source, which is what `Uuid::new_v4` is. A
 /// dedicated random crate would add a dependency to do the same thing.
@@ -93,11 +101,14 @@ impl FromRequestParts<AppState> for AdminUser {
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
         let token = bearer(parts).ok_or(AppError::Unauthorized)?;
+        let not_before = Utc::now() - Duration::days(ADMIN_SESSION_TTL_DAYS);
 
         let row: Option<(Uuid, String, String)> = sqlx::query_as(
-            "SELECT id, name, role FROM dashboard_users WHERE token_hash = $1",
+            "SELECT id, name, role FROM dashboard_users
+             WHERE token_hash = $1 AND token_issued_at > $2",
         )
         .bind(hash_token(&token))
+        .bind(not_before)
         .fetch_optional(&state.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -105,7 +116,7 @@ impl FromRequestParts<AppState> for AdminUser {
         match row {
             Some((id, name, role)) => Ok(AdminUser { id, name, role }),
             None => {
-                tracing::warn!("rejected a request carrying an unknown dashboard session token");
+                tracing::warn!("rejected a request carrying an unknown or expired dashboard session token");
                 Err(AppError::Unauthorized)
             }
         }

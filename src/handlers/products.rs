@@ -60,8 +60,11 @@ pub async fn verify_product(
 
 pub async fn alternatives(
     State(state): State<AppState>,
+    device: MaybeDevice,
+    ClientIp(ip): ClientIp,
     Query(query): Query<AlternativesQuery>,
 ) -> Result<Json<ApiResponse<Vec<ProductCard>>>> {
+    state.limit("alternatives", &subject(&device, &ip), LOOKUPS_PER_HOUR, HOUR).await?;
     let (alternatives, cached) = state
         .product_service
         .find_alternatives(&query.barcode, &query.country, &query.sort_by, query.limit)
@@ -85,8 +88,11 @@ pub async fn query_products(
 
 pub async fn trending(
     State(state): State<AppState>,
+    device: MaybeDevice,
+    ClientIp(ip): ClientIp,
     Query(query): Query<TrendingQuery>,
 ) -> Result<Json<ApiResponse<Vec<ProductCard>>>> {
+    state.limit("trending", &subject(&device, &ip), LOOKUPS_PER_HOUR, HOUR).await?;
     let (cards, cached) = state
         .product_service
         .trending(&query.country, query.limit)

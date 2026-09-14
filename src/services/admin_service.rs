@@ -3,7 +3,7 @@
 //! the migration comment on `dashboard_users` for why.
 
 use crate::{
-    auth,
+    auth::{self, AdminUser},
     error::{AppError, Result},
     models::{AdminProfile, AdminSession, DashboardUser, LoginRequest, RegisterRequest},
 };
@@ -34,12 +34,30 @@ impl AdminService {
     /// what makes "I will be the admin" true without a manual database
     /// edit. Every account after it starts as `member`.
     ///
+    /// Only that first account is a genuinely open sign-up: once one exists,
+    /// `caller` must be an authenticated admin, or this is a stranger who
+    /// found the URL, not a teammate being invited. Previously the only gate
+    /// past the first account was the per-address rate limit — real, but not
+    /// the same as actually requiring an invite.
+    ///
     /// ponytail: this reads-then-writes the count without a lock, so two
     /// truly simultaneous first registrations could both become admin.
     /// Real risk only exists in the first few seconds this table has ever
     /// existed; an advisory lock is the upgrade if that ever matters.
     #[tracing::instrument(skip_all)]
-    pub async fn register(&self, req: &RegisterRequest) -> Result<AdminSession> {
+    pub async fn register(&self, req: &RegisterRequest, caller: Option<&AdminUser>) -> Result<AdminSession> {
+        let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dashboard_users")
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        if existing > 0 {
+            match caller {
+                Some(admin) => admin.require_admin()?,
+                None => return Err(AppError::Unauthorized),
+            }
+        }
+
         let name = validate_name(&req.name)?;
         let email = normalize_email(&req.email)?;
         validate_password(&req.password)?;
@@ -53,11 +71,6 @@ impl AdminService {
 
         let password_hash = hash_password(&req.password)?;
         let token = auth::new_token();
-
-        let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dashboard_users")
-            .fetch_one(&self.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
         let role = if existing == 0 { "admin" } else { "member" };
 
         let user = sqlx::query_as::<_, DashboardUser>(

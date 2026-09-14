@@ -1,5 +1,5 @@
 use crate::{
-    auth::{AdminUser, ClientIp},
+    auth::{AdminUser, ClientIp, MaybeAdminUser},
     error::Result,
     models::{AdminProfile, AdminSession, ApiResponse, LoginRequest, RegisterRequest, UpdateRoleRequest},
     state::AppState,
@@ -11,7 +11,9 @@ use axum::{
 use uuid::Uuid;
 
 /// A handful of staff accounts, not a public sign-up flow — small limits on
-/// purpose.
+/// purpose. The rate limit alone used to be the only gate on registration
+/// after the first account; AdminService::register now also requires an
+/// existing admin's token for every account after the first.
 const REGISTRATIONS_PER_HOUR: u32 = 10;
 const LOGIN_ATTEMPTS_PER_HOUR: u32 = 20;
 const HOUR: u64 = 3600;
@@ -19,10 +21,11 @@ const HOUR: u64 = 3600;
 pub async fn register(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
+    caller: MaybeAdminUser,
     Json(body): Json<RegisterRequest>,
 ) -> Result<Json<ApiResponse<AdminSession>>> {
     state.limit("admin_register", &ip, REGISTRATIONS_PER_HOUR, HOUR).await?;
-    let session = state.admin_service.register(&body).await?;
+    let session = state.admin_service.register(&body, caller.0.as_ref()).await?;
     Ok(Json(ApiResponse::success(session, false)))
 }
 

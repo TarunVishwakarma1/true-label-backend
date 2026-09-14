@@ -137,6 +137,20 @@ impl FromRequestParts<AppState> for MaybeDevice {
     }
 }
 
+/// For `/admin/auth/register`: open for the very first account (there's no
+/// admin yet to gate behind), but every account after that needs an actual
+/// admin inviting them — see `AdminService::register`.
+#[derive(Debug, Clone)]
+pub struct MaybeAdminUser(pub Option<AdminUser>);
+
+impl FromRequestParts<AppState> for MaybeAdminUser {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        Ok(MaybeAdminUser(AdminUser::from_request_parts(parts, state).await.ok()))
+    }
+}
+
 fn bearer(parts: &Parts) -> Option<String> {
     let header = parts.headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
     let token = header.strip_prefix("Bearer ").or_else(|| header.strip_prefix("bearer "))?;

@@ -27,8 +27,8 @@ pub use product::{
 pub use response::{ApiResponse, HealthResponse, ReadinessResponse, ServiceStatus};
 pub use user::{
     AdminUserDetail, AdminUserPage, ContributionStats, DeviceRegistration, IdentityResponse,
-    LinkAccountRequest, ListUsersQuery, ProfileResponse, SubscriptionResponse,
-    UpdateProfileRequest, User,
+    LinkAccountRequest, LinkGoogleAccountRequest, ListUsersQuery, ProfileResponse,
+    SubscriptionResponse, UpdateProfileRequest, User,
 };
 pub use verification::{Verification, VerifyProductRequest};
 pub use webhook::{GitHubIssuePayload, GitHubIssueWebhookPayload};

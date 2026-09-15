@@ -16,6 +16,7 @@ pub fn me_router() -> Router<AppState> {
         .route("/subscription", post(crate::handlers::users::activate_subscription))
         .route("/subscription", delete(crate::handlers::users::cancel_subscription))
         .route("/link", post(crate::handlers::users::link_account))
+        .route("/link/google", post(crate::handlers::users::link_google_account))
         .route("/unlink", post(crate::handlers::users::unlink_account))
         // Required of any app that creates accounts: deletion, from inside
         // the app, not a support email.

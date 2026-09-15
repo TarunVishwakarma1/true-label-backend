@@ -11,6 +11,7 @@ pub struct User {
     pub plus_expires_at: Option<DateTime<Utc>>,
     pub plus_source: Option<String>,
     pub apple_user_id: Option<String>,
+    pub google_user_id: Option<String>,
     pub email: Option<String>,
     pub display_name: Option<String>,
     pub linked_at: Option<DateTime<Utc>>,
@@ -45,8 +46,12 @@ pub struct IdentityResponse {
 impl From<&User> for IdentityResponse {
     fn from(u: &User) -> Self {
         Self {
-            signed_in: u.apple_user_id.is_some(),
-            provider: u.apple_user_id.as_ref().map(|_| "apple".to_string()),
+            signed_in: u.apple_user_id.is_some() || u.google_user_id.is_some(),
+            provider: u
+                .apple_user_id
+                .as_ref()
+                .map(|_| "apple".to_string())
+                .or_else(|| u.google_user_id.as_ref().map(|_| "google".to_string())),
             email: u.email.clone(),
             display_name: u.display_name.clone(),
             linked_at: u.linked_at,
@@ -135,6 +140,16 @@ pub struct LinkAccountRequest {
     /// Apple hands the name to the client on first authorization only, and
     /// never puts it in the token, so the client forwards it here or it is
     /// lost.
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LinkGoogleAccountRequest {
+    /// Google's signed ID token from Credential Manager. Verified against
+    /// Google's published keys before anything is written — this endpoint
+    /// is otherwise unauthenticated, so an unverified token would let a
+    /// caller claim somebody else's account.
+    pub id_token: String,
     pub display_name: Option<String>,
 }
 

@@ -89,6 +89,17 @@ pub async fn link_account(
     Ok(Json(ApiResponse::success(profile, false)))
 }
 
+pub async fn link_google_account(
+    State(state): State<AppState>,
+    device: Device,
+    Json(body): Json<crate::models::LinkGoogleAccountRequest>,
+) -> Result<Json<ApiResponse<ProfileResponse>>> {
+    // Same cost class as the Apple path: a Google key fetch and a signature check.
+    state.limit("link", &device.id, WRITES_PER_HOUR, HOUR).await?;
+    let profile = state.user_service.link_google(&device.id, &body).await?;
+    Ok(Json(ApiResponse::success(profile, false)))
+}
+
 pub async fn unlink_account(
     State(state): State<AppState>,
     device: Device,

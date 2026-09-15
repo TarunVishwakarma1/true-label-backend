@@ -12,6 +12,12 @@ pub struct Env {
     pub rust_log: String,
     /// Audience an Apple identity token must carry — this app's bundle id.
     pub apple_bundle_id: String,
+    /// Audience a Google identity token must carry — the **Web
+    /// application** OAuth client ID from Google Cloud Console (not the
+    /// separate Android-type client, which has no secret and is never sent
+    /// here). Absent means Google sign-in refuses cleanly at the one
+    /// endpoint that needs it, same posture as `github_token`.
+    pub google_oauth_client_id: Option<String>,
     /// How many proxies sit in front of this process. `X-Forwarded-For` is
     /// only meaningful if you know this: everything left of what your own
     /// proxies appended is written by the caller. Zero ignores the header.
@@ -103,6 +109,9 @@ impl Env {
         let apple_bundle_id = std::env::var("APPLE_BUNDLE_ID")
             .unwrap_or_else(|_| "com.tarun.truelable".to_string());
 
+        let google_oauth_client_id =
+            std::env::var("GOOGLE_OAUTH_CLIENT_ID").ok().filter(|v| !v.is_empty());
+
         let trusted_proxy_hops = std::env::var("TRUSTED_PROXY_HOPS")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
@@ -142,6 +151,7 @@ impl Env {
             max_redis_connections,
             rust_log,
             apple_bundle_id,
+            google_oauth_client_id,
             trusted_proxy_hops,
             allowed_origins,
             github_token,

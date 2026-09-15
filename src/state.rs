@@ -1,7 +1,7 @@
 use crate::config::Env;
 use crate::services::{
-    AdminService, AppleAuth, CacheService, CrashReportService, GitHubService, OcrService,
-    ProductService, UserService,
+    AdminService, AppleAuth, CacheService, CrashReportService, GitHubService, GoogleAuth,
+    OcrService, ProductService, UserService,
 };
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
@@ -28,6 +28,7 @@ impl AppState {
         let user_service = Arc::new(UserService::new(
             db.clone(),
             AppleAuth::new(config.apple_bundle_id.clone()),
+            GoogleAuth::new(config.google_oauth_client_id.clone()),
         ));
         let admin_service = Arc::new(AdminService::new(db.clone()));
         let github = GitHubService::new(config.github_token.clone(), config.github_repo.clone());

@@ -3,9 +3,10 @@ use crate::{
     error::{AppError, Result},
     models::{
         AdminUserDetail, AdminUserPage, ContributionStats, DeviceRegistration, LinkAccountRequest,
-        ListUsersQuery, ProfileResponse, SubscriptionResponse, UpdateProfileRequest, User,
+        LinkGoogleAccountRequest, ListUsersQuery, ProfileResponse, SubscriptionResponse,
+        UpdateProfileRequest, User,
     },
-    services::AppleAuth,
+    services::{AppleAuth, GoogleAuth},
 };
 use serde_json::json;
 use sqlx::PgPool;
@@ -20,11 +21,12 @@ const MAX_DISPLAY_NAME_LEN: usize = 120;
 pub struct UserService {
     db: PgPool,
     apple: AppleAuth,
+    google: GoogleAuth,
 }
 
 impl UserService {
-    pub fn new(db: PgPool, apple: AppleAuth) -> Self {
-        Self { db, apple }
+    pub fn new(db: PgPool, apple: AppleAuth, google: GoogleAuth) -> Self {
+        Self { db, apple, google }
     }
 
     /// The device id is ours to generate, not the client's to choose. When
@@ -244,15 +246,102 @@ impl UserService {
         Ok(ProfileResponse::from(user))
     }
 
-    /// Signing out detaches the identity and keeps the device row, so the
-    /// app keeps working and nothing is destroyed. Deleting the account is a
-    /// separate, explicit action.
+    /// Sibling of `link_apple` — same account-moves-with-the-identity shape,
+    /// same column-preservation dance, just `google_user_id` instead of
+    /// `apple_user_id`. Kept as a separate method rather than folding the
+    /// two into one provider-generic function: two providers isn't enough
+    /// to be worth the abstraction, and the duplicated shape is a smaller
+    /// diff to read than an indirection would be.
+    #[tracing::instrument(skip_all)]
+    pub async fn link_google(&self, device_id: &str, req: &LinkGoogleAccountRequest) -> Result<ProfileResponse> {
+        validate_device_id(device_id)?;
+        let claims = self.google.verify(&req.id_token).await?;
+        let display_name = req
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(|n| n.chars().take(MAX_DISPLAY_NAME_LEN).collect::<String>());
+
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        sqlx::query("INSERT INTO users (device_id) VALUES ($1) ON CONFLICT (device_id) DO NOTHING")
+            .bind(device_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let previous = sqlx::query_as::<_, User>(
+            "SELECT * FROM users WHERE google_user_id = $1 AND device_id <> $2",
+        )
+        .bind(&claims.sub)
+        .bind(device_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        if let Some(previous) = &previous {
+            sqlx::query("DELETE FROM users WHERE device_id = $1")
+                .bind(&previous.device_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            tracing::info!(from = %previous.device_id, "account moved to this device");
+        }
+
+        let user = sqlx::query_as::<_, User>(
+            "UPDATE users SET
+               google_user_id = $2,
+               email = COALESCE($3, $6, users.email),
+               display_name = COALESCE($4, $7, users.display_name),
+               dietary_preferences = CASE
+                   WHEN users.dietary_preferences = '[]'::jsonb THEN COALESCE($8, users.dietary_preferences)
+                   ELSE users.dietary_preferences END,
+               plus_since = COALESCE(users.plus_since, $9),
+               plus_expires_at = COALESCE(users.plus_expires_at, $10),
+               plus_source = COALESCE(users.plus_source, $11),
+               linked_at = COALESCE(users.linked_at, NOW()),
+               country = COALESCE($5, users.country),
+               updated_at = NOW()
+             WHERE device_id = $1
+             RETURNING *",
+        )
+        .bind(device_id)
+        .bind(&claims.sub)
+        .bind(claims.email.as_deref())
+        .bind(display_name.as_deref())
+        .bind(Option::<String>::None)
+        .bind(previous.as_ref().and_then(|p| p.email.clone()))
+        .bind(previous.as_ref().and_then(|p| p.display_name.clone()))
+        .bind(previous.as_ref().map(|p| p.dietary_preferences.clone()))
+        .bind(previous.as_ref().and_then(|p| p.plus_since))
+        .bind(previous.as_ref().and_then(|p| p.plus_expires_at))
+        .bind(previous.as_ref().and_then(|p| p.plus_source.clone()))
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        tx.commit().await.map_err(|e| AppError::Database(e.to_string()))?;
+        tracing::info!("google account linked");
+        Ok(ProfileResponse::from(user))
+    }
+
+    /// Signing out detaches whichever identity is attached and keeps the
+    /// device row, so the app keeps working and nothing is destroyed.
+    /// Clears both provider columns unconditionally — harmless when one was
+    /// already null, and it means sign-out behaves the same regardless of
+    /// which provider was used, without a second unlink method. Deleting
+    /// the account is a separate, explicit action.
     #[tracing::instrument(skip_all)]
     pub async fn unlink(&self, device_id: &str) -> Result<ProfileResponse> {
         validate_device_id(device_id)?;
         let user = sqlx::query_as::<_, User>(
-            "UPDATE users SET apple_user_id = NULL, email = NULL, display_name = NULL,
-                              linked_at = NULL, updated_at = NOW()
+            "UPDATE users SET apple_user_id = NULL, google_user_id = NULL, email = NULL,
+                              display_name = NULL, linked_at = NULL, updated_at = NOW()
              WHERE device_id = $1 RETURNING *",
         )
         .bind(device_id)
@@ -432,6 +521,7 @@ mod tests {
             plus_expires_at: expires,
             plus_source: plus_since.map(|_| "complimentary".to_string()),
             apple_user_id: None,
+            google_user_id: None,
             email: None,
             display_name: None,
             linked_at: None,
@@ -488,6 +578,18 @@ mod tests {
         // without one is normal, not an error.
         assert!(signed_in.email.is_none());
         assert_eq!(signed_in.display_name.as_deref(), Some("Tarun"));
+    }
+
+    #[test]
+    fn identity_reports_google_when_only_a_google_id_is_attached() {
+        use crate::models::IdentityResponse;
+
+        let mut u = user(None, None);
+        u.google_user_id = Some("109876543210".to_string());
+        u.display_name = Some("Tarun".to_string());
+        let signed_in = IdentityResponse::from(&u);
+        assert!(signed_in.signed_in);
+        assert_eq!(signed_in.provider.as_deref(), Some("google"));
     }
 
     #[test]

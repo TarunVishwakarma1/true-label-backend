@@ -365,12 +365,26 @@ fn parse_search_results(json: &Value) -> Vec<ProductCard> {
             }
             let facts = p.get("nutriments").cloned().unwrap_or(Value::Null);
             let num = |key: &str| per_100g(&facts, key);
+            let nutriscore_grade = p
+                .get("nutriscore_grade")
+                .and_then(Value::as_str)
+                .filter(|g| *g != "unknown")
+                .map(str::to_string)
+                .or_else(|| {
+                    let facts_obj = nutriments(p);
+                    let is_beverage = tags(p, "categories_tags").is_some_and(|tags| {
+                        tags.iter().any(|t| t.contains("beverage") || t.contains("drink"))
+                    });
+                    crate::services::nutriscore::calculate_nutriscore(&facts_obj, is_beverage)
+                        .map(|(_, g)| g)
+                });
+
             Some(ProductCard {
                 barcode,
                 product_name: name,
                 brand: p.get("brands").and_then(Value::as_str).map(str::to_string),
                 image_url: p.get("image_url").and_then(Value::as_str).map(str::to_string),
-                nutriscore_grade: p.get("nutriscore_grade").and_then(Value::as_str).map(str::to_string),
+                nutriscore_grade,
                 nova_group: p.get("nova_group").and_then(Value::as_i64).map(|n| n as i16),
                 verified: false,
                 energy_kcal: num("energy-kcal"),

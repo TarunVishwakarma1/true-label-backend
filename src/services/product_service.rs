@@ -819,7 +819,13 @@ impl From<&serde_json::Value> for OffFields {
             allergens: text("allergens"),
             additives: extract_additives(product_obj),
             nova_group: product_obj.get("nova_group").and_then(|v| v.as_i64()).map(|n| n as i16),
-            nutriscore_grade: text("nutriscore_grade"),
+            nutriscore_grade: {
+                let raw = text("nutriscore_grade").filter(|g| g != "unknown");
+                raw.or_else(|| {
+                    crate::services::nutriscore::calculate_nutriscore(&nutrition_facts, is_beverage)
+                        .map(|(_, grade)| grade)
+                })
+            },
             is_vegan: dietary_flag(&analysis_tags, "en:vegan", "en:non-vegan"),
             is_vegetarian: dietary_flag(&analysis_tags, "en:vegetarian", "en:non-vegetarian"),
             is_palm_oil_free: dietary_flag(&analysis_tags, "en:palm-oil-free", "en:palm-oil"),
@@ -843,7 +849,11 @@ impl From<&serde_json::Value> for OffFields {
             nutriscore_score: product_obj
                 .get("nutriscore_score")
                 .and_then(|v| v.as_i64())
-                .map(|n| n as i32),
+                .map(|n| n as i32)
+                .or_else(|| {
+                    crate::services::nutriscore::calculate_nutriscore(&nutrition_facts, is_beverage)
+                        .map(|(score, _)| score)
+                }),
             ecoscore_grade: text("ecoscore_grade"),
             completeness: product_obj.get("completeness").and_then(|v| v.as_f64()).map(|v| v as f32),
             last_modified: product_obj.get("last_modified_t").and_then(|v| v.as_i64()),

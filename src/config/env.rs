@@ -43,6 +43,10 @@ pub struct Env {
     /// that one endpoint refuses every request — there's no way to trust an
     /// unsigned delivery, so "unset" has to mean "closed," not "open."
     pub github_webhook_secret: Option<String>,
+    /// Optional webhook URL (Slack / Discord / Custom endpoint) where instant
+    /// notifications are dispatched for key events: new user registration,
+    /// access requests, role updates, and new crash reports.
+    pub notification_webhook_url: Option<String>,
     /// `warn_about_exposure`'s loopback check assumes this process's own
     /// bind address is what stands between it and the public internet —
     /// true for a droplet (backend + nginx, same host), false inside a
@@ -137,6 +141,9 @@ impl Env {
         let github_webhook_secret =
             std::env::var("GITHUB_WEBHOOK_SECRET").ok().filter(|v| !v.is_empty());
 
+        let notification_webhook_url =
+            std::env::var("NOTIFICATION_WEBHOOK_URL").ok().filter(|v| !v.is_empty());
+
         let trust_container_network = std::env::var("TRUST_CONTAINER_NETWORK")
             .ok()
             .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
@@ -158,6 +165,7 @@ impl Env {
             github_repo,
             dashboard_url,
             github_webhook_secret,
+            notification_webhook_url,
             trust_container_network,
         })
     }

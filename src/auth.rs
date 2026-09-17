@@ -98,13 +98,25 @@ impl AdminUser {
         }
     }
 
+    /// For actions reserved for active team members and admins (e.g. browsing products, users, team).
+    /// Users with role `new-user` only have access to crash reports until elevated.
+    pub fn require_member_or_admin(&self) -> Result<(), AppError> {
+        if self.role == "admin" || self.role == "member" {
+            Ok(())
+        } else {
+            Err(AppError::Forbidden(
+                "Member or admin role required. Please request access from an administrator.".to_string(),
+            ))
+        }
+    }
+
     /// Product editing is opened up past `role` on purpose — "selected
     /// users," not "admins only." Does NOT cover `/verify`, which stays
     /// `require_admin`-gated: granting someone edit rights on a product's
     /// data isn't the same as trusting their judgment on whether it's
     /// correct enough to mark verified.
     pub fn require_product_edit(&self) -> Result<(), AppError> {
-        if self.role == "admin" || self.can_edit_products {
+        if self.role == "admin" || (self.role == "member" && self.can_edit_products) {
             Ok(())
         } else {
             Err(AppError::Forbidden("product edit permission required".to_string()))

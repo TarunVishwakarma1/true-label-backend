@@ -3,9 +3,15 @@ use axum_test::TestServer;
 use truelabel_backend::{build_app, config::Env};
 
 fn test_config() -> Env {
+    dotenvy::dotenv().ok();
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql://postgres:postgres@localhost:5432/postgres".to_string());
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+
     Env {
-        database_url: "postgresql://postgres:postgres@localhost:5432/truelabel".to_string(),
-        redis_url: "redis://localhost:6379".to_string(),
+        database_url,
+        redis_url,
         server_host: "0.0.0.0".to_string(),
         server_port: 8080,
         app_env: truelabel_backend::config::AppEnvironment::Test,
@@ -21,6 +27,7 @@ fn test_config() -> Env {
         dashboard_url: None,
         github_webhook_secret: None,
         trust_container_network: false,
+        notification_webhook_url: None,
     }
 }
 

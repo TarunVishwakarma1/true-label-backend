@@ -10,21 +10,23 @@ use axum::{
 };
 use uuid::Uuid;
 
-/// Any signed-in staff account can browse — same posture as crash reports.
+/// Browsing is open to members and admins.
 pub async fn list(
     State(state): State<AppState>,
-    _user: AdminUser,
+    user: AdminUser,
     Query(query): Query<ListAdminProductsQuery>,
 ) -> Result<Json<ApiResponse<AdminProductPage>>> {
+    user.require_member_or_admin()?;
     let page = state.product_service.list_admin(&query).await?;
     Ok(Json(ApiResponse::success(page, false)))
 }
 
 pub async fn get(
     State(state): State<AppState>,
-    _user: AdminUser,
+    user: AdminUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<Product>>> {
+    user.require_member_or_admin()?;
     let product = state.product_service.get_by_id(id).await?;
     Ok(Json(ApiResponse::success(product, false)))
 }

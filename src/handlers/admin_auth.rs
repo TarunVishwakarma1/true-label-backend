@@ -63,15 +63,30 @@ pub async fn logout(
     Ok(Json(ApiResponse::success(serde_json::json!({ "signed_out": true }), false)))
 }
 
-/// Any signed-in staff account can see who else is on the team — it's the
-/// same posture as seeing who filed a crash report. Changing a role is the
-/// privileged part, gated in the handler below.
+/// Any active team member or admin can see who else is on the team.
 pub async fn list_team(
     State(state): State<AppState>,
-    _user: AdminUser,
+    user: AdminUser,
 ) -> Result<Json<ApiResponse<Vec<AdminProfile>>>> {
+    user.require_member_or_admin()?;
     let team = state.admin_service.list_team().await?;
     Ok(Json(ApiResponse::success(team, false)))
+}
+
+pub async fn request_access(
+    State(state): State<AppState>,
+    user: AdminUser,
+    Json(body): Json<crate::models::RequestAccessRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>> {
+    state.limit("admin_request_access", &user.id.to_string(), 10, HOUR).await?;
+    state
+        .admin_service
+        .request_access(user.id, body.resource.as_deref(), body.message.as_deref())
+        .await?;
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({ "requested": true }),
+        false,
+    )))
 }
 
 pub async fn update_role(

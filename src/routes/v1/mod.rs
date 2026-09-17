@@ -1,8 +1,8 @@
 pub mod admin;
 pub mod crash_reports;
+pub mod me;
 pub mod ocr;
 pub mod products;
-pub mod me;
 pub mod webhooks;
 
 use crate::state::AppState;
@@ -21,5 +21,6 @@ pub fn v1_router() -> Router<AppState> {
         .nest("/admin/activity", admin::admin_activity_router())
         .nest("/admin/products", admin::admin_products_router())
         .nest("/admin/users", admin::admin_users_router())
+        .nest("/admin/notifications", admin::admin_notifications_router())
         .nest("/webhooks", webhooks::webhooks_router())
 }

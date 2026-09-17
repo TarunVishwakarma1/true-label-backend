@@ -101,3 +101,33 @@ pub struct ResetPasswordRequest {
 pub struct UpdatePermissionsRequest {
     pub can_edit_products: bool,
 }
+
+/// Request submitted by a user (e.g. role `new-user`) asking for role elevation or resource access.
+#[derive(Debug, Deserialize)]
+pub struct RequestAccessRequest {
+    pub resource: Option<String>,
+    pub message: Option<String>,
+}
+
+/// An in-app dashboard notification record.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct DashboardNotification {
+    pub id: Uuid,
+    pub user_id: Option<Uuid>,
+    pub target_role: Option<String>,
+    pub title: String,
+    pub message: String,
+    pub category: String,
+    pub link: Option<String>,
+    pub is_read: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Response payload containing list of in-app notifications and unread badge count.
+#[derive(Debug, Serialize)]
+pub struct NotificationListResponse {
+    pub items: Vec<DashboardNotification>,
+    pub unread_count: i64,
+}
+
+

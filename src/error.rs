@@ -47,31 +47,31 @@ pub enum AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, error_message) = match &self {
-            AppError::ProductNotFound => (StatusCode::NOT_FOUND, "Product not found"),
+            AppError::ProductNotFound => (StatusCode::NOT_FOUND, "Product not found".to_string()),
             AppError::InvalidBarcode => (
                 StatusCode::BAD_REQUEST,
-                "Invalid barcode format (8-14 digits)",
+                "Invalid barcode format (8-14 digits)".to_string(),
             ),
-            AppError::InvalidCountry => (StatusCode::BAD_REQUEST, "Invalid country code"),
-            AppError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Database error"),
-            AppError::Cache(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Cache error"),
-            AppError::ExternalApi(_) => (StatusCode::BAD_GATEWAY, "External API error"),
-            AppError::OcrFailed(_) => (StatusCode::BAD_REQUEST, "OCR processing failed"),
-            AppError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, "Invalid request"),
+            AppError::InvalidCountry => (StatusCode::BAD_REQUEST, "Invalid country code".to_string()),
+            AppError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Database error".to_string()),
+            AppError::Cache(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Cache error".to_string()),
+            AppError::ExternalApi(_) => (StatusCode::BAD_GATEWAY, "External API error".to_string()),
+            AppError::OcrFailed(msg) => (StatusCode::BAD_REQUEST, format!("OCR processing failed: {msg}")),
+            AppError::InvalidRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             AppError::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
-                "Missing or invalid device token",
+                "Missing or invalid authentication token".to_string(),
             ),
-            AppError::Forbidden(_) => (
+            AppError::Forbidden(msg) => (
                 StatusCode::FORBIDDEN,
-                "You don't have permission to do that",
+                msg.clone(),
             ),
-            AppError::Conflict(_) => (StatusCode::CONFLICT, "Conflict"),
+            AppError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
             AppError::TooManyRequests => (
                 StatusCode::TOO_MANY_REQUESTS,
-                "Too many requests — slow down and try again shortly",
+                "Too many requests — slow down and try again shortly".to_string(),
             ),
-            AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"),
+            AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".to_string()),
         };
 
         // Every error used to reach the client with zero server-side trace

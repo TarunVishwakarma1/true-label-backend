@@ -22,29 +22,29 @@ const MAX_NAME_LEN: usize = 120;
 const MAX_EMAIL_LEN: usize = 255;
 const MAX_OCCUPATION_LEN: usize = 120;
 
+use crate::services::{NotificationService, WebhookService};
+
 pub struct AdminService {
     db: PgPool,
+    webhook: WebhookService,
+    notifications: NotificationService,
 }
 
 impl AdminService {
-    pub fn new(db: PgPool) -> Self {
-        Self { db }
+    pub fn new(db: PgPool, webhook: WebhookService, notifications: NotificationService) -> Self {
+        Self { db, webhook, notifications }
     }
 
     /// The first account this dashboard ever creates is the admin — that is
     /// what makes "I will be the admin" true without a manual database
-    /// edit. Every account after it starts as `member`.
+    /// edit.
     ///
-    /// Only that first account is a genuinely open sign-up: once one exists,
-    /// `caller` must be an authenticated admin, or this is a stranger who
-    /// found the URL, not a teammate being invited. Previously the only gate
-    /// past the first account was the per-address rate limit — real, but not
-    /// the same as actually requiring an invite.
+    /// If an existing admin is inviting a teammate (`caller = Some(admin)`),
+    /// the new account starts as `member`.
     ///
-    /// ponytail: this reads-then-writes the count without a lock, so two
-    /// truly simultaneous first registrations could both become admin.
-    /// Real risk only exists in the first few seconds this table has ever
-    /// existed; an advisory lock is the upgrade if that ever matters.
+    /// Self-service registrations without an existing session (`caller = None`)
+    /// are created with the role `new-user` (view-only access to crash reports
+    /// until elevated by an administrator).
     #[tracing::instrument(skip_all)]
     pub async fn register(&self, req: &RegisterRequest, caller: Option<&AdminUser>) -> Result<AdminSession> {
         let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dashboard_users")
@@ -53,9 +53,8 @@ impl AdminService {
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         if existing > 0 {
-            match caller {
-                Some(admin) => admin.require_admin()?,
-                None => return Err(AppError::Unauthorized),
+            if let Some(admin) = caller {
+                admin.require_admin()?;
             }
         }
 
@@ -72,7 +71,13 @@ impl AdminService {
 
         let password_hash = hash_password(&req.password)?;
         let token = auth::new_token();
-        let role = if existing == 0 { "admin" } else { "member" };
+        let role = if existing == 0 {
+            "admin"
+        } else if caller.is_some() {
+            "member"
+        } else {
+            "new-user"
+        };
 
         let user = sqlx::query_as::<_, DashboardUser>(
             "INSERT INTO dashboard_users
@@ -98,8 +103,6 @@ impl AdminService {
         })?;
 
         tracing::info!(role = %user.role, "dashboard account registered");
-        // Only a real invite, not the first-account bootstrap — nobody
-        // "invited" the very first admin, there was no one to do it.
         if let Some(admin) = caller {
             audit::record(
                 &self.db,
@@ -111,7 +114,31 @@ impl AdminService {
                 serde_json::json!({ "email": user.email, "role": user.role }),
             )
             .await;
+        } else if existing > 0 {
+            audit::record(
+                &self.db,
+                None,
+                &user.name,
+                "team.member_self_registered",
+                "dashboard_user",
+                user.id,
+                serde_json::json!({ "email": user.email, "role": user.role }),
+            )
+            .await;
         }
+
+        self.webhook.notify_user_registered(&user.name, &user.email, &user.role);
+        if existing > 0 {
+            let _ = self.notifications.create(
+                None,
+                Some("admin"),
+                "New User Registered",
+                &format!("{} ({}) registered as a new user with role {}.", user.name, user.email, user.role),
+                "user_registration",
+                Some("/dashboard/team"),
+            ).await;
+        }
+
         Ok(AdminSession { token, profile: AdminProfile::from(user) })
     }
 
@@ -190,7 +217,7 @@ impl AdminService {
     /// itself out with no way back in short of a direct database edit.
     #[tracing::instrument(skip_all)]
     pub async fn update_role(&self, actor: &AdminUser, user_id: Uuid, role: &str) -> Result<AdminProfile> {
-        let role = one_of("role", role, &["admin", "member"])?;
+        let role = one_of("role", role, &["admin", "member", "new-user"])?;
 
         let target = sqlx::query_as::<_, DashboardUser>("SELECT * FROM dashboard_users WHERE id = $1")
             .bind(user_id)
@@ -225,7 +252,65 @@ impl AdminService {
             serde_json::json!({ "from": target.role, "to": user.role }),
         )
         .await;
+
+        self.webhook
+            .notify_role_changed(&actor.name, &user.name, &user.email, &target.role, &user.role);
+
+        let _ = self.notifications.create(
+            Some(user.id),
+            None,
+            "Role Updated",
+            &format!("Admin {} changed your role to {}.", actor.name, user.role),
+            "role_change",
+            Some("/dashboard"),
+        ).await;
+
         Ok(AdminProfile::from(user))
+    }
+
+    /// User submits a request for resource access or role elevation.
+    #[tracing::instrument(skip_all)]
+    pub async fn request_access(
+        &self,
+        user_id: Uuid,
+        resource: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<()> {
+        let user = sqlx::query_as::<_, DashboardUser>("SELECT * FROM dashboard_users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .ok_or(AppError::Unauthorized)?;
+
+        audit::record(
+            &self.db,
+            Some(user.id),
+            &user.name,
+            "team.access_requested",
+            "dashboard_user",
+            user.id,
+            serde_json::json!({
+                "resource": resource,
+                "message": message,
+            }),
+        )
+        .await;
+
+        self.webhook
+            .notify_access_requested(&user.name, &user.email, resource, message);
+
+        let resource_str = resource.unwrap_or("Resource Access / Role Elevation");
+        let _ = self.notifications.create(
+            None,
+            Some("admin"),
+            "Access Requested",
+            &format!("{} ({}) requested {}.", user.name, user.email, resource_str),
+            "access_request",
+            Some("/dashboard/team"),
+        ).await;
+
+        Ok(())
     }
 
     /// Self-service. Requires the current password — the bearer token alone
@@ -362,6 +447,20 @@ impl AdminService {
             serde_json::json!({ "can_edit_products": can_edit_products }),
         )
         .await;
+
+        self.webhook
+            .notify_permissions_changed(&actor.name, &user.name, can_edit_products);
+
+        let perm_desc = if can_edit_products { "granted" } else { "revoked" };
+        let _ = self.notifications.create(
+            Some(target_id),
+            None,
+            "Permissions Updated",
+            &format!("Admin {} {} product editing permissions for your account.", actor.name, perm_desc),
+            "permission_change",
+            Some("/dashboard/products"),
+        ).await;
+
         Ok(AdminProfile::from(user))
     }
 }
